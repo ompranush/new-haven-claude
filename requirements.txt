@@ -1,9 +1,10 @@
-streamlit>=1.38
+streamlit>=1.45
 pandas>=2.2
 numpy>=1.26
 plotly>=5.24
 networkx>=3.3
 pytest>=8
-
-# optional: the Claude cognition layer and documentary narrator
-# anthropic>=1.0
+anthropic>=1.0
+openai>=1.50
+supabase>=2.0
+cryptography>=42

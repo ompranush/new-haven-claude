@@ -44,15 +44,21 @@ def _drift(world):
             hardship += 0.08
         if world.food_price > 6 and c.money < 1500:
             hardship += 0.03
-        if pct < 0.25 and gini > 0.4:
-            hardship += 0.03
+        if pct < 0.3 and gini > 0.42:
+            hardship += 0.02 * (gini - 0.3) * 5                 # the poor resent visible inequality
+        if pct > 0.75 and pol.tax_rate > 0.2:
+            hardship += 0.02 * (pol.tax_rate - 0.15) * 10       # the rich resent the tax bill
+        if c.employer_id is not None and c.last_wage < world.config["base_wage"] * 0.8:
+            hardship += 0.01                                    # working poor
+        if c.goal_progress < 0.15 and c.age_on(world.day) > 30:
+            hardship += 0.005                                   # frustrated ambition
         if c.happiness < 0.45:
             hardship += 0.03
         if c.infected:
             hardship += 0.02
         if world.strike and c.employer_id is not None and c.id not in world.strike["members"]:
             hardship += 0.01
-        relief = 0.015 if (c.employer_id is not None and c.happiness > 0.6) else 0.0
+        relief = 0.012 if (c.employer_id is not None and c.happiness > 0.6) else 0.0
         if pol.welfare > 0 and c.employer_id is None:
             relief += 0.015
         c.grievance = float(np.clip(c.grievance + hardship * (0.6 + 0.8 * c.personality["neuroticism"]) - relief - 0.003, 0, 1))
@@ -209,15 +215,91 @@ def _strike(world):
 
 
 def apply_platform(world, platform: dict, ruling: str):
-    e = platform["economic"]
+    e, a = platform["economic"], platform["authority"]
     pol = world.policy
     pol.ruling_party = ruling
-    pol.tax_rate = float(np.clip(0.16 - 0.14 * e, 0.04, 0.35))
-    pol.welfare = 9.0 if e < -0.2 else (4.0 if e < 0.15 else 0.0)
-    pol.pension = 8.0 if e < -0.1 else (3.0 if e < 0.3 else 0.0)
-    pol.min_wage = world.config["base_wage"] * 0.8 if e < -0.3 else 0.0
-    pol.public_education = e < 0.05
-    pol.public_health = e < 0.2
+    pol.platform = dict(platform)
+    pol.took_office = world.day
+    pol.tax_rate = float(np.clip(0.18 - 0.18 * e, 0.04, 0.40))
+    pol.welfare = 12.0 if e < -0.3 else (8.0 if e < -0.05 else (3.0 if e < 0.2 else 0.0))
+    pol.pension = 10.0 if e < -0.1 else (4.0 if e < 0.3 else 0.0)
+    pol.min_wage = world.config["base_wage"] * (1.0 if e < -0.4 else 0.8) if e < -0.2 else 0.0
+    pol.public_education = e < 0.1
+    pol.public_health = e < 0.25
+    pol.laws = []
+    pol.approval = 0.6
+
+
+LAW_TEXT = {"rationing": "bread rationing — everyone eats while the granary lasts, and the price is capped",
+            "quarantine": "a quarantine — the taverns and market are shut and gatherings banned",
+            "public_works": "a public works programme — the treasury hires the unemployed",
+            "tax_holiday": "a tax holiday to revive trade",
+            "curfew": "a curfew and militia patrols",
+            "poor_relief": "emergency poor relief paid from the treasury"}
+
+
+def _govern(world):
+    """Weekly: the government responds to conditions according to its platform, and its approval moves."""
+    pol = world.policy
+    e, a = pol.platform["economic"], pol.platform["authority"]
+    adults = world.adults()
+    if not adults:
+        return
+    famine = world.food_price > 6
+    unemployment = world.unemployment > 0.15
+    hungry_share = sum(1 for c in adults if c.hunger > 0.5) / len(adults)
+
+    def enact(law):
+        if law not in pol.laws:
+            pol.laws.append(law)
+            world.emit("politics", f"The {pol.ruling_party} introduced {LAW_TEXT[law]}.", 0.7,
+                       [max(adults, key=lambda c: c.reputation).id])
+
+    def repeal(law):
+        if law in pol.laws:
+            pol.laws.remove(law)
+            world.emit("politics", f"The {pol.ruling_party} lifted the {law.replace('_', ' ')}.", 0.45)
+
+    # left governments ration and relieve; authoritarian ones quarantine and impose curfews; market governments cut taxes
+    if famine and (e < 0.0 or hungry_share > 0.3):
+        enact("rationing")
+    elif not famine and world.food_price < 4:
+        repeal("rationing")
+    if world.pandemic and (a > -0.1 or world.pandemic["deaths"] > 3):
+        enact("quarantine")
+    elif not world.pandemic:
+        repeal("quarantine")
+    if unemployment and e < 0.1 and world.treasury > 3000:
+        enact("public_works")
+    elif not unemployment:
+        repeal("public_works")
+    if world.recession_days > 0 and e > 0.0:
+        enact("tax_holiday")
+    elif world.recession_days == 0:
+        repeal("tax_holiday")
+    g = float(np.mean([c.grievance for c in adults]))
+    if a > 0.3 and g > 0.5:
+        enact("curfew")
+    elif g < 0.3:
+        repeal("curfew")
+    if hungry_share > 0.15 and e < 0.3 and world.treasury > 1000:
+        enact("poor_relief")
+    elif hungry_share < 0.05:
+        repeal("poor_relief")
+
+    # approval: contentment blended with trust, moving slowly, dented by crises
+    content = 0.6 * float(np.mean([max(0.0, 1 - 1.2 * c.grievance) for c in adults])) + 0.4 * float(np.mean([c.beliefs["trust"] for c in adults]))
+    pol.approval = float(np.clip(pol.approval * 0.85 + content * 0.15 - (0.04 if famine else 0) - (0.02 if world.pandemic else 0), 0, 1))
+    if "curfew" in pol.laws:
+        for c in adults:
+            c.happiness = max(0, c.happiness - 0.003)
+            c.beliefs["authority"] = float(np.clip(c.beliefs["authority"] - 0.002 * c.personality["openness"], -1, 1))
+    # a government nobody supports falls — after a year's grace, and only after weeks of it
+    pol.low_weeks = getattr(pol, "low_weeks", 0) + 1 if pol.approval < 0.22 else 0
+    if pol.low_weeks >= 6 and world.day - pol.took_office > 365 and world.rng.random() < 0.3:
+        pol.low_weeks = 0
+        world.emit("politics", f"With approval at {pol.approval*100:.0f}%, the {pol.ruling_party} lost the confidence of the town.", 0.9)
+        election(world, snap=True)
 
 
 def election(world, snap: bool = False):
@@ -244,7 +326,7 @@ def election(world, snap: bool = False):
             if c.movement_id and world.movements[c.movement_id].name == name:
                 d -= 0.5
             if name == incumbent_name:
-                d += 0.6 * c.grievance - 0.3 * c.beliefs["trust"]
+                d += 0.9 * c.grievance - 0.4 * c.beliefs["trust"] + 0.6 * (0.5 - world.policy.approval)
             if d < best_d:
                 best, best_d = name, d
         votes[best] += 1
@@ -263,6 +345,10 @@ def election(world, snap: bool = False):
                 c.happiness = min(1, c.happiness + 0.1)
             else:
                 c.grievance = min(1, c.grievance + 0.05)
+    if changed:
+        for c in adults:                       # a new government gets a honeymoon
+            c.grievance *= 0.6
+            c.beliefs["trust"] = min(1, c.beliefs["trust"] + 0.1)
     lead = next((m.founder_id for m in parties if m.name == winner), None)
     kind = "Snap election" if snap else f"Election of year {world.year}"
     world.emit("politics", f"{kind}: {winner} {'took power' if changed else 'held on'} with {100*votes[winner]/total:.0f}% "
@@ -279,6 +365,7 @@ def election(world, snap: bool = False):
 def daily(world):
     if world.day % 7 == 0:
         _drift(world)
+        _govern(world)
         adults = world.adults()
         for c in adults:
             try_found_movement(world, c)

@@ -79,6 +79,8 @@ class Citizen:
     immune: bool = False
     infected_day: Optional[int] = None
     last_wage: float = 0.0
+    backstory: str = ""               # who they say they are (sponsored citizens)
+    sponsor: str = ""                 # display name of the person who adopted them, if any
 
     def age_on(self, day: int) -> int:
         return max(0, (day - self.born_day) // 365)
@@ -120,6 +122,7 @@ class Business:
     alive: bool = True
     closed_day: Optional[int] = None
     loss_days: int = 0
+    livestock: int = 0               # farms keep a herd; it grazes on the map and adds to the food supply
 
 
 @dataclass
@@ -146,6 +149,10 @@ class Policy:
     public_education: bool = False
     public_health: bool = False
     ruling_party: str = "Founders' Council"
+    platform: Dict[str, float] = field(default_factory=lambda: {"economic": 0.15, "authority": 0.1})
+    laws: List[str] = field(default_factory=list)      # active emergency laws: rationing, quarantine, public_works, tax_holiday, curfew
+    approval: float = 0.6
+    took_office: int = 0
 
 
 @dataclass
@@ -156,3 +163,4 @@ class WorldEvent:
     importance: float = 0.2           # 0..1, feeds the chronicle and the brain gate
     actors: List[int] = field(default_factory=list)
     brain: str = ""                   # which brain (if any) processed this event
+    tone: str = ""                    # "good" / "bad" / "" — how it lands on the first actor

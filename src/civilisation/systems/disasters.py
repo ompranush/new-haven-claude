@@ -30,27 +30,37 @@ def inject(world, name: str, **kw):
         return
     if name == "drought":
         world.food *= 0.5
-        for b in world.open_businesses():
-            if b.kind == "farm":
-                b.inventory = 0
+        world.drought_days = kw.get("days", 90)
         for c in alive:
             c.happiness = max(0, c.happiness - 0.06)
-        world.emit("disaster", "A severe drought withered the fields. Food reserves halved and the price of bread doubled.", 0.8,
+        world.emit("disaster", "A severe drought has set in. The fields are yielding half of normal and the granary is half empty.", 0.85,
                    [max(alive, key=lambda c: c.reputation).id] if alive else [])
+        _reckon(world, "drought")
     elif name == "flood":
-        victims = []
+        from . import economy, lifecycle
+        victims, wrecked = [], []
         for b in world.open_businesses():
             if _near_water(world, b.x, b.y, 3):
-                b.cash -= 800
-                b.loss_days += 5
+                farms_left = sum(1 for f in world.open_businesses() if f.kind == "farm")
+                if rng.random() < 0.5 and len(wrecked) < 2 and not (b.kind == "farm" and farms_left <= 1):
+                    wrecked.append(b.name)
+                    economy.bankrupt(world, b)
+                else:
+                    b.cash -= 1500
+                    b.loss_days += 10
         for c in alive:
-            if _near_water(world, *c.home, 2) and rng.random() < 0.06:
-                victims.append(c)
+            if _near_water(world, *c.home, 2):
+                if rng.random() < 0.1:
+                    victims.append(c)
+                elif rng.random() < 0.5:
+                    c.home = world._random_home()      # washed out, rehoused
+                    c.money *= 0.6
+                    c.remember(world.day, "The river took the house. We start again.", "grief", 0.7, tag="disaster")
         for c in victims:
-            from . import lifecycle
             lifecycle.die(world, c, "flood")
-        world.emit("disaster", f"The river burst its banks. Riverside businesses were wrecked and {len(victims)} people drowned.", 0.85,
+        world.emit("disaster", f"The river burst its banks. {len(victims)} people drowned; {', '.join(wrecked) if wrecked else 'no business'} washed away.", 0.9,
                    [v.id for v in victims[:2]] or ([rng.choice(alive).id] if alive else []))
+        _reckon(world, "flood")
     elif name == "pandemic":
         if world.pandemic:
             return
@@ -59,13 +69,19 @@ def inject(world, name: str, **kw):
         _infect(world, sociable)
         world.pandemic = {"start": world.day, "deaths": 0, "cases": 1, "peak": 1, "name": kw.get("name", rng.choice(["the Grey Cough", "River Fever", "the Sweats", "the Autumn Sickness"]))}
         world.emit("disaster", f"{sociable.name} fell ill with something nobody recognises. They call it {world.pandemic['name']}.", 0.7, [sociable.id])
+        _reckon(world, "pandemic")
     elif name == "recession":
-        world.recession_days = kw.get("days", 120)
-        world.emit("economy", "Trade routes dried up. Demand for goods collapsed across the town.", 0.75,
+        world.recession_days = kw.get("days", 240)
+        for b in world.open_businesses():
+            b.cash *= 0.7
+        world.emit("economy", "Trade routes dried up. Demand collapsed and every ledger in town turned red.", 0.8,
                    [b.owner_id for b in world.open_businesses() if b.owner_id][:1])
+        _reckon(world, "recession")
     elif name == "boom":
         world.food += len(alive) * 15
-        world.config["demand_multiplier"] = 1.5
+        world.boom_days = kw.get("days", 120)
+        for b in world.open_businesses():
+            b.cash += 500
         world.emit("economy", "A bumper harvest and merchants from afar: a boom season begins.", 0.6)
     elif name == "breakthrough":
         world.tech *= 1.15
@@ -94,6 +110,8 @@ def inject(world, name: str, **kw):
         world.treasury -= stolen
         for b in world.open_businesses():
             b.cash *= 0.7
+            if b.kind == "farm":
+                b.livestock = max(0, getattr(b, "livestock", 0) - rng.randint(1, 3))     # they take the animals too
         adults = [c for c in alive if c.age_on(world.day) >= 16] or alive
         hurt = rng.sample(adults, min(6, len(adults)))
         dead = []
@@ -103,8 +121,14 @@ def inject(world, name: str, **kw):
                 from . import lifecycle
                 lifecycle.die(world, c, "raid")
                 dead.append(c)
-        world.emit("disaster", f"Bandits raided the town at night, stealing £{stolen:,.0f} from the treasury. {len(hurt)} were hurt, {len(dead)} killed.", 0.85,
-                   [c.id for c in hurt[:3]])
+        burned = None
+        if world.open_businesses() and rng.random() < 0.7:
+            from . import economy
+            burned = rng.choice(world.open_businesses())
+            economy.bankrupt(world, burned)
+        world.emit("disaster", f"Bandits raided the town at night, stealing £{stolen:,.0f} from the treasury{' and burning ' + burned.name if burned else ''}. "
+                               f"{len(hurt)} were hurt, {len(dead)} killed.", 0.9, [c.id for c in hurt[:3]])
+        _reckon(world, "raid")
         for c in alive:
             if c.alive:
                 c.beliefs["authority"] = min(1, c.beliefs["authority"] + 0.1)
@@ -134,7 +158,46 @@ def inject(world, name: str, **kw):
             world.citizens[c.id] = c
         world.emit("society", f"A caravan of {n} newcomers arrived, looking for work and somewhere to sleep.", 0.6)
     else:
-        raise ValueError(f"Unknown injection {name!r}. Options: {', '.join(INJECTABLE)}")
+        from ..presets import PRESETS
+        from ..commands import apply_plan
+        if name in PRESETS:
+            return apply_plan(world, PRESETS[name](world), source="rules")
+        raise ValueError(f"Unknown injection {name!r}. Options: {', '.join(all_injectable())}")
+
+
+def all_injectable(world=None) -> dict:
+    """Built-in shocks plus the preset catalogue, name -> description; filtered by the world's era if given."""
+    from ..presets import DESCRIPTIONS
+    allb = {**INJECTABLE, **DESCRIPTIONS}
+    if world is not None:
+        from ..eras import era
+        off = era(world)["shocks_off"]
+        allb = {k: v for k, v in allb.items() if k not in off}
+    return allb
+
+
+def _reckon(world, name, days=30):
+    """Schedule a 'one month later' summary so consequences are visible, not just the shock."""
+    snap = {"pop": len(world.alive()), "biz": len(world.open_businesses()), "price": world.food_price,
+            "wealth": float(np.median([c.money for c in world.alive()])) if world.alive() else 0}
+    world.reckonings = getattr(world, "reckonings", [])
+    world.reckonings.append((world.day + days, name, snap))
+
+
+def _run_reckonings(world):
+    due = [r for r in getattr(world, "reckonings", []) if r[0] <= world.day]
+    if not due:
+        return
+    world.reckonings = [r for r in world.reckonings if r[0] > world.day]
+    for _, name, snap in due:
+        alive = world.alive()
+        dead = snap["pop"] - len(alive)
+        closed = snap["biz"] - len(world.open_businesses())
+        med = float(np.median([c.money for c in alive])) if alive else 0
+        hungry = sum(1 for c in alive if c.hunger > 0.5)
+        jobless = sum(1 for c in world.adults() if c.employer_id is None and c.age_on(world.day) < 65)
+        world.emit("disaster", f"A month after the {name}: {max(0, dead)} dead, {max(0, closed)} businesses closed, {hungry} going hungry, "
+                               f"{jobless} without work, bread £{world.food_price:.0f}, median savings £{med:,.0f} (was £{snap['wealth']:,.0f}).", 0.75)
 
 
 def _near_water(world, x, y, r):
@@ -156,7 +219,8 @@ def try_transmit(world, a: Citizen, b: Citizen):
     src, dst = (a, b) if a.infected else (b, a)
     if dst.immune or dst.infected:
         return
-    if world.rng.random() < 0.12:
+    p = 0.06 if "quarantine" in world.policy.laws else 0.18
+    if world.rng.random() < p:
         _infect(world, dst)
 
 
@@ -167,12 +231,12 @@ def _pandemic_tick(world):
     infected = [c for c in world.alive() if c.infected]
     p["peak"] = max(p["peak"], len(infected))
     for c in infected:
-        c.health -= 0.02
-        if rng.random() < 0.006 * (1.5 - c.health) * (0.6 if clinic else 1.0) * (1.5 if c.age_on(world.day) > 60 else 1.0):
+        c.health -= 0.03
+        if rng.random() < 0.012 * (1.5 - c.health) * (0.6 if clinic else 1.0) * (2.0 if c.age_on(world.day) > 60 else 1.0):
             from . import lifecycle
             lifecycle.die(world, c, "illness")
             p["deaths"] += 1
-        elif world.day - c.infected_day > 14:
+        elif world.day - c.infected_day > 21:
             c.infected = False
             c.immune = True
             c.remember(world.day, f"Recovered from {p['name']}.", "hope", 0.4, tag="disaster")
@@ -185,6 +249,13 @@ def _pandemic_tick(world):
 
 def daily(world):
     rng = world.rng
+    _run_reckonings(world)
+    if world.drought_days > 0:
+        world.drought_days -= 1
+        if world.drought_days == 0:
+            world.emit("environment", "The rains returned. The drought is over.", 0.55)
+    if world.boom_days > 0:
+        world.boom_days -= 1
     if world.pandemic:
         _pandemic_tick(world)
     if world.day % 30 == 0:
@@ -196,8 +267,6 @@ def daily(world):
         world.recession_days -= 1
         if world.recession_days == 0:
             world.emit("economy", "Trade slowly recovered; the recession is over.", 0.5)
-    if world.config["demand_multiplier"] > 1.0 and rng.random() < 0.01:
-        world.config["demand_multiplier"] = 1.0
     if not world.config["random_shocks"]:
         return
     roll = rng.random()

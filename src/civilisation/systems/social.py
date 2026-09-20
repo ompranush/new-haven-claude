@@ -105,7 +105,7 @@ def interact(world, a: Citizen, b: Citizen):
             a.money -= gift
             b.money += gift
             adjust(world, b, a, 18)
-            world.emit("social", f"{a.name} helped {b.name} with £{gift:.0f} when they had nothing.", 0.45, [b.id, a.id])
+            world.emit("social", f"{a.name} helped {b.name} with £{gift:.0f} when they had nothing.", 0.45, [b.id, a.id], tone="good")
     else:
         adjust(world, a, b, -rng.uniform(1.5, 5))
         a.happiness = max(0, a.happiness - 0.004)
@@ -114,8 +114,8 @@ def interact(world, a: Citizen, b: Citizen):
         if rng.random() < p_insult:
             public = rng.random() < 0.4
             adjust(world, b, a, -rng.uniform(10, 22))
-            where = "in front of everyone at the tavern" if public else "in private"
-            world.emit("social", f"{a.name} insulted {b.name} {where}.", 0.45 if public else 0.35, [b.id, a.id])
+            from ..personality import insult_text
+            world.emit("social", insult_text(world, a, b, public), 0.45 if public else 0.35, [b.id, a.id], tone="bad")
             if public:
                 a.reputation -= 0.05
     # grievance is contagious

@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import pytest
 from civilisation import World, SilentBrain, chronicle_text
 from civilisation.brains import RulesBrain, Reaction
-from civilisation.systems.disasters import INJECTABLE
+from civilisation.systems.disasters import INJECTABLE, all_injectable
 from civilisation.experiments import run_one
 
 
@@ -62,7 +62,8 @@ def test_generations_and_inheritance():
 
 
 def test_every_injection_runs():
-    for name in INJECTABLE:
+    assert len(all_injectable()) > len(INJECTABLE)
+    for name in all_injectable():
         w = World(seed=11, population=40)
         w.step(30)
         w.inject(name)
@@ -146,3 +147,102 @@ def test_save_load(tmp_path):
 def test_experiment_row():
     row = run_one(("baseline", 1, 1, 40))
     assert row["scenario"] == "baseline" and "gini" in row and row["population"] > 0
+
+
+def test_decree_plan_executes():
+    from civilisation.commands import apply_plan, FALLBACK, select
+    w = World(seed=9, population=60)
+    w.step(30)
+    before = len(w.open_businesses())
+    done = apply_plan(w, FALLBACK["gold"], source="rules")
+    assert len(w.open_businesses()) >= before + 2
+    assert any("newcomers" in d for d in done)
+    assert w.chronicle[-1].category == "decree"
+    plan = {"narration": "Test.", "importance": 0.6, "effects": [
+        {"op": "money", "params": {"target": "poorest:5", "delta": 1000}},
+        {"op": "policy", "params": {"field": "tax_rate", "value": 0.3}},
+        {"op": "law", "params": {"name": "rationing", "enact": True}},
+        {"op": "kill", "params": {"target": "random:2", "cause": "a duel"}},
+        {"op": "bogus", "params": {}}]}
+    n = len(w.alive())
+    apply_plan(w, plan, source="rules")
+    assert w.policy.tax_rate == 0.3 and "rationing" in w.policy.laws and len(w.alive()) == n - 2
+
+
+def test_persistence_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_SECRET", "test-secret")
+    from civilisation.persistence import SQLiteStore, Recorder, restore_world, encrypt_key, decrypt_key
+    store = SQLiteStore(str(tmp_path / "t.db"))
+    rec = Recorder(store, "v", snapshot_every=5)
+    w = World(seed=4, population=40)
+    w.step(12); rec.flush(w)
+    assert rec.last_error == "" and store.read_events("v") and store.read_metrics("v")
+    w2 = restore_world(store, "v")
+    assert w2.day == 12 and w2.brain is not None
+    w2.step(3)                                   # a restored world must keep running
+    tok = encrypt_key("sk-abc")
+    assert tok != "sk-abc" and decrypt_key(tok) == "sk-abc"
+    store.write_resident("v", {"citizen_id": 1, "name": "A", "sponsor": "s", "provider": "openai", "model": "gpt-5", "enc_key": tok, "max_calls": 10})
+    assert store.read_residents("v")[0]["enc_key"] == tok
+
+
+def test_steward_controls():
+    from civilisation.person import apply_person_plan, rules_interpret_person
+    from civilisation.brains import RulesBrain
+    w = World(seed=5, population=60)
+    w.step(60)
+    c = w.adopt("Ada Okonkwo", "F", 28, {"openness": .8, "conscientiousness": .5, "extraversion": .8, "agreeableness": .5, "neuroticism": .3}, "A smith's daughter.", sponsor="t", brain=RulesBrain())
+    other = next(x for x in w.alive() if x.id != c.id and not x.spouse_id and x.age_on(w.day) >= 20)
+    done = apply_person_plan(w, c, {"effects": [{"op": "goal", "params": {"goal": "start a business"}}] + [{"op": "visit", "params": {"who": other.name}}] * 5
+                                    + [{"op": "propose", "params": {"who": other.name}}, {"op": "nope", "params": {}}]})
+    assert c.goal == "start a business" and c.spouse_id == other.id and any("unknown op" in d for d in done)
+    c.money = 5000
+    plan = rules_interpret_person(w, c, "open a tavern")
+    apply_person_plan(w, c, plan)
+    assert any(b.kind == "tavern" and b.owner_id == c.id for b in w.open_businesses())
+
+
+def test_security_helpers(monkeypatch):
+    from civilisation.security import esc, clean_text, scrub, check_base_url, sign_blob, verify_blob, Limiter
+    assert esc('<img onerror="x">') == "&lt;img onerror=&quot;x&quot;&gt;"
+    assert clean_text("a\x00b\x1fc" + "x" * 100, 5) == "abcxx"
+    assert "sk-" not in scrub("Error 401 for key sk-ant-abcdefghijklmnop at api") and "[redacted]" in scrub("token sk-abcdefghijklmnop")
+    for bad in ("http://example.com/v1", "https://localhost/v1", "https://127.0.0.1/v1", "https://10.0.0.1/v1", "https://169.254.169.254/latest"):
+        try:
+            check_base_url(bad); assert False, bad
+        except ValueError:
+            pass
+    monkeypatch.setenv("APP_SECRET", "s3cret")
+    signed = sign_blob(b"payload")
+    assert signed != b"payload" and verify_blob(signed) == b"payload"
+    try:
+        verify_blob(signed[:-1] + b"X"); assert False
+    except ValueError:
+        pass
+    try:
+        verify_blob(b"payload"); assert False        # unsigned refused when a secret is set
+    except ValueError:
+        pass
+    lim = Limiter(2, 60)
+    lim.hit("k"); lim.hit("k")
+    assert not lim.allow("k") and lim.allow("other")
+
+
+def test_adopt_sanitises_input():
+    w = World(seed=1, population=30)
+    c = w.adopt("<b>Evil</b>\x00Name" + "x" * 100, "Z", 5, {}, "story\x07", sponsor="s" * 100)
+    assert "\x00" not in c.name and len(c.name) <= 40 and c.sex == "M" and c.age_on(w.day) == 18 and len(c.sponsor) == 40
+
+
+def test_custom_provider_gated(monkeypatch):
+    from civilisation.providers import make_backend, BackendError
+    monkeypatch.delenv("ALLOW_CUSTOM_PROVIDERS", raising=False)
+    for prov in ("custom", "ollama"):
+        try:
+            make_backend(prov, "m", api_key="k", base_url="https://example.com/v1"); assert False
+        except BackendError:
+            pass
+    try:
+        make_backend("openai", "gpt-5", api_key="k", base_url="https://evil.example/v1"); assert False
+    except BackendError:
+        pass

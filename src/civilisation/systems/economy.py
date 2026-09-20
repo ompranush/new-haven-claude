@@ -41,12 +41,18 @@ def hire(world, c: Citizen, b: Business):
             c.rel(other).kind = "colleague" if c.rel(other).kind == "acquaintance" else c.rel(other).kind
 
 
-def needs_staff(b: Business, food_price: float = 0.0) -> bool:
+def farm_yield(world) -> float:
+    """Food units one farmer grows per day right now (drought, technology)."""
+    return FOOD_PER_FARMER * 0.9 * world.tech * (0.45 if world.drought_days > 0 else 1.0)
+
+
+def needs_staff(b: Business, food_price: float = 0.0, world=None) -> bool:
     """A business hires only when another pair of hands would pay for itself."""
     if len(b.employees) >= MAX_EMPLOYEES:
         return False
-    if b.kind == "farm" and food_price > 5:
-        return True                       # scarcity pulls labour into food, cash or no cash
+    if b.kind == "farm" and world is not None:
+        # scarcity pulls labour into food — but only while a farmer's grain is worth more than their wage
+        return farm_yield(world) * food_price > b.wage * 1.1
     if b.cash < 15 * b.wage:
         return False
     if len(b.revenue_history) < 7 or len(b.employees) == 0:
@@ -56,7 +62,7 @@ def needs_staff(b: Business, food_price: float = 0.0) -> bool:
 
 
 def hire_anyone(world, c: Citizen) -> bool:
-    open_bs = [b for b in world.open_businesses() if needs_staff(b, world.food_price)]
+    open_bs = [b for b in world.open_businesses() if needs_staff(b, world.food_price, world)]
     if not open_bs:
         return False
     # prefer nearby, cash-rich businesses
@@ -86,8 +92,11 @@ def daily(world):
     cfg = world.config
     alive = world.alive()
     adults = [c for c in alive if c.age_on(world.day) >= 18]
-    demand_mult = cfg["demand_multiplier"] * (0.6 if world.recession_days > 0 else 1.0)
+    laws = world.policy.laws
+    demand_mult = cfg["demand_multiplier"] * (0.5 if world.recession_days > 0 else 1.0) * (1.4 if world.boom_days > 0 else 1.0) \
+        * (1.2 if "tax_holiday" in laws else 1.0) * (0.7 if "quarantine" in laws else 1.0)
     striking = set(world.strike["members"]) if world.strike else set()
+    drought = 0.45 if world.drought_days > 0 else 1.0
 
     # ---- production
     open_bs = world.open_businesses()
@@ -98,8 +107,16 @@ def daily(world):
         n = len(workers)
         skill = float(np.mean([world.citizens[e].skill for e in workers])) if workers else 0.0
         eff = (0.5 + skill) * world.tech * b.productivity
+        if "quarantine" in laws and b.kind in ("tavern", "market", "school"):
+            n = 0                                            # shut by law
         if b.kind == "farm":
-            produced = n * FOOD_PER_FARMER * eff * rng.uniform(0.85, 1.15)
+            produced = n * FOOD_PER_FARMER * eff * rng.uniform(0.85, 1.15) * drought
+            herd = getattr(b, "livestock", 0)
+            produced += herd * 1.2 * (0.6 if drought < 1 else 1.0)          # milk, eggs, the odd slaughter
+            if herd and n and rng.random() < 0.0012 * herd and herd < 12:
+                b.livestock = herd + 1
+            elif herd and drought < 1 and rng.random() < 0.01:
+                b.livestock = herd - 1                                      # the herd thins in a drought
             food_produced += produced
             b.inventory += produced
         else:
@@ -111,6 +128,10 @@ def daily(world):
     # ---- prices: a week of reserves is "normal"
     weekly_need = max(1.0, len(alive) * 7.0)
     world.food_price = float(np.clip(3.5 * (weekly_need / max(1.0, world.food)) ** 0.5, 1.0, 12.0))
+    market_price = world.food_price
+    world.market_price = market_price
+    if "rationing" in laws and world.treasury > 0:
+        world.food_price = min(world.food_price, 4.0)
     squeeze = max(0.0, world.food_price / 3.5 - 1)      # cost-of-living pressure
 
     # ---- citizens eat and spend
@@ -121,7 +142,7 @@ def daily(world):
     for c in alive:
         age = c.age_on(world.day)
         # eat: children are fed by parents (we just charge the world's food)
-        if world.food >= 1.0 and (c.money >= world.food_price or age < 18):
+        if world.food >= 1.0 and (c.money >= world.food_price or age < 18 or "rationing" in laws):
             world.food -= 1.0
             payer = c
             if age < 18 and c.parent_ids:
@@ -159,6 +180,12 @@ def daily(world):
             b.cash += food_revenue * s
             b.revenue_today += food_revenue * s
             b.inventory = 0.0
+    subsidy = (market_price - world.food_price) * max(0.0, food_revenue / max(0.01, world.food_price))
+    if subsidy > 0:                      # rationing: the treasury tops farms up to the market price
+        subsidy = min(subsidy, world.treasury)
+        world.treasury -= subsidy
+        food_revenue += subsidy
+    world.food_price = market_price if "rationing" not in laws else world.food_price
     world.gdp_today += food_revenue
     # tradable goods earn export income from outside the town
     for bid, out in outputs.items():
@@ -182,8 +209,9 @@ def daily(world):
     pol = world.policy
     for b in open_bs:
         if b.kind == "farm":
-            # a farmer is worth what their grain sells for; the wage follows the price of bread
-            b.wage = max(b.wage, 0.6 * FOOD_PER_FARMER * 0.9 * world.food_price * world.tech)
+            # a farmer is worth what their grain sells for; the wage follows the price of bread and the harvest
+            worth = 0.6 * farm_yield(world) * world.food_price
+            b.wage = max(min(b.wage, worth * 1.3), worth, cfg["base_wage"] * 0.5)
         b.revenue_history.append(b.revenue_today)
         if len(b.revenue_history) > 60:
             b.revenue_history.pop(0)
@@ -196,7 +224,7 @@ def daily(world):
             if c.age_on(world.day) >= 65 and rng.random() < 0.01:
                 retire(world, c)
                 continue
-            tax = wage * pol.tax_rate
+            tax = wage * pol.tax_rate * (0.5 if "tax_holiday" in laws else 1.0)
             c.money += wage - tax
             c.last_wage = wage
             world.treasury += tax
@@ -219,7 +247,7 @@ def daily(world):
             b.loss_days = max(0, b.loss_days - 1)
             if profit / max(1, len(b.employees)) > 0.5 * b.wage and rng.random() < 0.15:
                 b.wage = min(b.wage * 1.03, cfg["base_wage"] * 2.2)
-            if b.cash > 25 * payroll + 800 and needs_staff(b, world.food_price) and rng.random() < 0.15:
+            if b.cash > 25 * payroll + 800 and needs_staff(b, world.food_price, world) and rng.random() < 0.15:
                 unemployed = [c for c in adults if c.employer_id is None and c.age_on(world.day) < 65 and not c.infected]
                 if unemployed:
                     pick = max(rng.sample(unemployed, min(4, len(unemployed))), key=lambda c: c.skill)
@@ -227,7 +255,7 @@ def daily(world):
                     world.emit("work", f"{pick.name} was hired at {b.name}.", 0.25, [pick.id])
                     pick.remember(world.day, f"Got a job at {b.name}.", "joy", 0.3, tag="work")
         # a business that wants staff but can't justify them at this wage lets the wage drift down
-        if len(b.employees) < 4 and b.wage > cfg["base_wage"] and not needs_staff(b, world.food_price) and rng.random() < 0.2:
+        if len(b.employees) < 4 and b.wage > cfg["base_wage"] and not needs_staff(b, world.food_price, world) and rng.random() < 0.2:
             b.wage = max(b.wage * 0.97, cfg["base_wage"])
         if profit <= 0:
             b.loss_days += 1
@@ -252,7 +280,7 @@ def daily(world):
         if c.employer_id is not None and rng.random() < (0.05 if world.food_price > 6 else 0.01):
             # look for a better-paid job (everyone looks harder when bread is dear)
             current = world.businesses[c.employer_id]
-            better = [b for b in world.open_businesses() if b.id != current.id and b.wage > current.wage * 1.15 and needs_staff(b, world.food_price)]
+            better = [b for b in world.open_businesses() if b.id != current.id and b.wage > current.wage * 1.15 and needs_staff(b, world.food_price, world)]
             if better:
                 b = max(better, key=lambda b: b.wage)
                 leave_job(world, c, "switched")
@@ -264,6 +292,14 @@ def daily(world):
             if pol.welfare > 0 and world.treasury > pol.welfare:
                 world.treasury -= pol.welfare
                 c.money += pol.welfare
+            if "public_works" in laws and world.treasury > cfg["base_wage"]:
+                pay = cfg["base_wage"] * 0.7
+                world.treasury -= pay
+                c.money += pay
+                c.happiness = min(1, c.happiness + 0.004)      # work, even mending roads, is dignity
+        if "poor_relief" in laws and c.hunger > 0.4 and world.treasury > 8:
+            world.treasury -= 8
+            c.money += 8
             if rng.random() < 0.04:
                 hire_anyone(world, c)
             elif world.food_price > 5 and c.hunger > 0.3:
@@ -271,11 +307,13 @@ def daily(world):
         # entrepreneurship
         ambition = c.personality["openness"] * 0.5 + c.personality["conscientiousness"] * 0.5
         wants = c.goal == "start a business" or c.employer_id is None
-        p_found = 0.004 * (3.0 if world.food_price > 6 else 1.0) * (2.0 if c.employer_id is None else 1.0)
-        if wants and c.money > cfg["startup_cost"] * 1.2 and ambition > 0.5 and rng.random() < p_found \
+        scarce = getattr(world, "market_price", world.food_price) > 6
+        p_found = 0.004 * (6.0 if scarce else 1.0) * (2.0 if c.employer_id is None else 1.0)
+        cost = cfg["startup_cost"] * (0.5 if scarce else 1.0)          # a farm on the commons is cheap to start when bread is dear
+        if wants and c.money > cost * 1.2 and ambition > (0.35 if scarce else 0.5) and rng.random() < p_found \
                 and len(world.open_businesses()) < max(12, len(alive) // 6):
-            kind = _best_kind(world)
-            c.money -= cfg["startup_cost"]
+            kind = "farm" if scarce and rng.random() < 0.8 else _best_kind(world)
+            c.money -= cost
             if c.employer_id is not None:
                 leave_job(world, c)
             b = world.found_business(c, kind)
@@ -283,6 +321,15 @@ def daily(world):
             world.emit("economy", f"{c.name} founded {b.name}.", 0.5, [c.id])
             c.remember(world.day, f"I opened {b.name} with my savings.", "pride", 0.7, tag="economy")
 
+    # ---- no farms at all: the council opens one on the commons before the town starves
+    if not any(b.kind == "farm" for b in world.open_businesses()) and world.treasury > 500 and adults:
+        steward = max((c for c in adults if c.employer_id is None), key=lambda c: c.skill, default=rng.choice(adults))
+        world.treasury -= 500
+        if steward.employer_id is not None:
+            leave_job(world, steward)
+        b = world.found_business(steward, "farm")
+        b.cash = 1500.0
+        world.emit("economy", f"With no farm left standing, the council opened {b.name} on the commons and put {steward.name} in charge.", 0.7, [steward.id])
     # ---- treasury interest-free overdraft limit: austerity if broke
     if world.treasury < -5000:
         world.policy.welfare = 0.0
@@ -300,7 +347,7 @@ def _best_kind(world):
         counts[b.kind] += 1
         rev[b.kind] += float(np.mean(b.revenue_history[-30:])) if b.revenue_history else 0
     score = {k: (rev[k] / max(1, counts[k])) / (1 + counts[k]) for k in STARTUP_KINDS}
-    if world.food_price > 5:   # food crisis → farms
+    if getattr(world, "market_price", world.food_price) > 5:   # food crisis → farms
         score["farm"] *= 3
     return max(score, key=score.get)
 

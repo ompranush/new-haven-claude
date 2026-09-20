@@ -104,17 +104,19 @@ class RulesBrain:
         r = Reaction(intensity=float(np.clip(ev.importance * (0.6 + 0.8 * p["neuroticism"]), 0.1, 1)))
         cat = ev.category
         text = ev.text.lower()
-        bad = any(w in text for w in ["died", "insult", "fired", "bankrupt", "lost", "flood", "drought", "attack",
-                                       "raid", "starv", "layoff", "laid off", "collapsed", "closed", "cheated", "robbed"])
-        good = any(w in text for w in ["married", "born", "founded", "opened", "promoted", "won", "discover",
-                                        "helped", "gave", "elected", "recovered", "hired"])
+        bad = ev.tone == "bad" or (not ev.tone and any(w in text for w in ["died", "insult", "fired", "bankrupt", "lost", "flood", "drought", "attack",
+                                       "raid", "starv", "layoff", "laid off", "collapsed", "closed", "cheated", "robbed", "mocked", "sneered", "accused", "laughed about", "crude joke", "layabout", "famine", "burst its banks", "riot"]))
+        good = ev.tone == "good" or (not ev.tone and not bad and any(w in text for w in ["married", "born", "founded", "opened", "promoted", "won", "discover",
+                                        "helped", "gave", "elected", "recovered", "hired", "took power", "raised wages"]))
         if bad:
             if "died" in text:
                 r.emotion = "grief"
-            elif p["agreeableness"] < 0.4 or (p["neuroticism"] > 0.6 and others):
+            elif others and (p["agreeableness"] < 0.45 or p["neuroticism"] > 0.6):
                 r.emotion = "anger"
+            elif cat in ("disaster", "economy", "work", "politics"):
+                r.emotion = "fear"
             else:
-                r.emotion = "fear" if p["neuroticism"] > 0.5 else "grief"
+                r.emotion = "anger" if p["agreeableness"] < 0.6 else "fear"
         elif good:
             r.emotion = "pride" if (c.id in ev.actors[:1] and p["extraversion"] > 0.5) else "joy"
         else:
@@ -167,15 +169,13 @@ class RulesBrain:
 
     @staticmethod
     def _memory_text(c: "Citizen", ev: "WorldEvent", r: Reaction) -> str:
-        flavour = {"anger": "I won't forget this.", "grief": "It still hurts.", "fear": "I felt the ground shift under me.",
-                   "joy": "One of the good days.", "pride": "I earned this.", "hope": "Maybe things are changing.",
-                   "shame": "I'd rather nobody knew.", "neutral": ""}[r.emotion]
+        from .personality import voice
         text = ev.text
         if text.startswith(c.name):
             text = "I" + text[len(c.name):]
         else:
-            text = text.replace(c.name, "me", 1)
-        return f"{text} {flavour}".strip()
+            text = text.replace(c.name + "'s", "my", 1).replace(c.name, "me", 1)
+        return voice(c, r.emotion, text, salt=ev.day)
 
 
 class SilentBrain:

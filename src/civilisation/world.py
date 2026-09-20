@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import pickle
 import random
+import threading
 from dataclasses import asdict, replace
 from typing import Dict, List, Optional
 
@@ -32,9 +33,10 @@ DEFAULT_CONFIG = dict(
     random_shocks=True,         # random droughts, floods etc.
     brain_threshold=0.4,        # events at/above this importance are sent to the brain
     chronicle_threshold=0.55,   # events at/above this importance are kept forever
-    election_period_days=4 * 365,
+    election_period_days=2 * 365,
     max_population=1500,
     demand_multiplier=1.0,
+    era="medieval",             # ancient | medieval | industrial | modern | future
 )
 
 
@@ -45,6 +47,11 @@ class World:
         self.seed = seed
         self.rng = random.Random(seed)
         self.config = {**DEFAULT_CONFIG, **(config or {})}
+        from .eras import ERAS
+        e = ERAS.get(self.config["era"], ERAS["medieval"])
+        for k in ("startup_cost", "base_wage"):
+            if k not in (config or {}):
+                self.config[k] = float(e[k])
         self.day = 0
         self.width, self.height = width, height
         self.grid = terrain.generate(self.rng, width, height)
@@ -58,16 +65,21 @@ class World:
         self.treasury = 2000.0
         self.food = population * 10.0
         self.food_price = 3.0
-        self.tech = 1.0
+        self.tech = float(e["tech"])
         self.gdp_today = 0.0
         self.gdp_year = 0.0
         self.unemployment = 0.0
         self.gini = 0.0
         self.pandemic: Optional[dict] = None
         self.recession_days = 0
+        self.drought_days = 0
+        self.boom_days = 0
         self.strike: Optional[dict] = None
+        self.thoughts: List[dict] = []            # first-person lines for the UI: {day, cid, name, text, source}
         self.next_election_day = self.config["election_period_days"]
         self.brain: Brain = brain or RulesBrain()
+        self.brains: Dict[int, Brain] = {}        # per-citizen brains (sponsored residents); never pickled
+        self.lock = threading.RLock()             # the shared village ticks on its own thread
         self.brain_calls = 0
         self._next_cid = 1
         self._next_bid = 1
@@ -121,11 +133,14 @@ class World:
 
     def found_business(self, owner: Citizen, kind: str, initial: bool = False) -> Business:
         spot = economy.pick_site(self, kind)
-        name = f"{self.rng.choice(BUSINESS_NAMES[kind])} {kind.title()}"
+        from .eras import kind_label
+        name = f"{self.rng.choice(BUSINESS_NAMES[kind])} {kind_label(self, kind)}"
         b = Business(id=self._next_bid, name=name, kind=kind, x=spot[0], y=spot[1], owner_id=owner.id,
                      founded_day=self.day, cash=2500.0 if initial else self.config["startup_cost"] * 0.8,
                      wage=self.config["base_wage"] * self.rng.uniform(0.8, 1.2))
         self._next_bid += 1
+        if kind == "farm":
+            b.livestock = self.rng.randint(2, 6)
         self.businesses[b.id] = b
         if owner.employer_id is None:
             owner.employer_id = b.id
@@ -134,9 +149,10 @@ class World:
         return b
 
     # ------------------------------------------------------------------ events
-    def emit(self, category: str, text: str, importance: float = 0.2, actors: Optional[List[int]] = None) -> WorldEvent:
-        ev = WorldEvent(self.day, category, text, float(importance), list(actors or []))
+    def emit(self, category: str, text: str, importance: float = 0.2, actors: Optional[List[int]] = None, tone: str = "") -> WorldEvent:
+        ev = WorldEvent(self.day, category, text, float(importance), list(actors or []), tone=tone)
         self.events.append(ev)
+        self.events_total = getattr(self, "events_total", 0) + 1
         if len(self.events) > 3000:
             self.events = self.events[-3000:]
         if importance >= self.config["chronicle_threshold"]:
@@ -146,22 +162,56 @@ class World:
         return ev
 
     def _consult_brain(self, ev: WorldEvent):
-        for cid in ev.actors[:3]:
+        # social incidents: only the person it happened *to* reacts; the perpetrator already acted
+        for cid in ev.actors[:1 if ev.category in ("social", "work") else 3]:
             c = self.citizens.get(cid)
             if not c or not c.alive:
                 continue
-            reaction = self.brain.react(self, c, ev)
+            reaction = self.brains.get(cid, self.brain).react(self, c, ev)
             if reaction is None:
                 continue
-            self.brain_calls += 1
-            ev.brain = reaction.source
-            reaction.apply(self, c, ev)
+            self._apply_reaction(c, ev, reaction)
+
+    def _apply_reaction(self, c: Citizen, ev: WorldEvent, reaction):
+        self.brain_calls += 1
+        ev.brain = reaction.source
+        reaction.apply(self, c, ev)
+        if reaction.memory:
+            self.think(c, reaction.memory, reaction.source, reaction.emotion)
+
+    def think(self, c: Citizen, text: str, source: str = "rules", emotion: str = "neutral"):
+        self.thoughts.append({"day": self.day, "cid": c.id, "name": c.name, "text": text, "source": source, "emotion": emotion})
+        self.thoughts_total = getattr(self, "thoughts_total", 0) + 1
+        if len(self.thoughts) > 400:
+            self.thoughts = self.thoughts[-400:]
 
     # ------------------------------------------------------------------ stepping
     def step(self, days: int = 1):
-        for _ in range(days):
+        with self.lock:
+            for _ in range(days):
+                self._step_day()
+
+    def _step_day(self):
             self.day += 1
             self.gdp_today = 0.0
+            import time as _t
+            now = _t.time()
+            for cid, b in list(self.brains.items()):        # session-only minds expire; the person carries on with the rules brain
+                exp = getattr(b, "expires_at", None)
+                if exp and now > exp:
+                    if hasattr(b, "forget_key"):
+                        b.forget_key()
+                    del self.brains[cid]
+                    c = self.citizens.get(cid)
+                    if c and c.alive:
+                        self.think(c, "My steward's voice has gone quiet. I'll manage on my own for a while.", "rules", "neutral")
+            for brain in [self.brain] + list(self.brains.values()):
+                drain = getattr(brain, "drain", None)
+                if drain:                               # deferred (async) cognition lands here
+                    for cid, ev, reaction in drain():
+                        c = self.citizens.get(cid)
+                        if c and c.alive:
+                            self._apply_reaction(c, ev, reaction)
             lifecycle.daily(self)
             economy.daily(self)
             social.daily(self)
@@ -184,7 +234,29 @@ class World:
 
     def inject(self, name: str, **kwargs):
         """God mode. See disasters.INJECTABLE for names."""
-        return disasters.inject(self, name, **kwargs)
+        with self.lock:
+            return disasters.inject(self, name, **kwargs)
+
+    def adopt(self, name: str, sex: str, age: int, personality: Dict[str, float], backstory: str = "",
+              sponsor: str = "", brain: Optional[Brain] = None, money: float = 400.0) -> Citizen:
+        """A visitor moves their own person into the village, optionally with their own brain (and key)."""
+        from .security import clean_text
+        name, backstory, sponsor = clean_text(name, 40), clean_text(backstory, 600), clean_text(sponsor, 40)
+        sex = "F" if sex == "F" else "M"
+        age = int(min(90, max(18, int(age))))
+        with self.lock:
+            home = self._random_home()
+            c = Citizen(id=self._new_id(), name=name or self.new_name(sex), sex=sex, born_day=self.day - int(age) * 365,
+                        personality={k: float(np.clip(personality.get(k, 0.5), 0.02, 0.98)) for k in TRAITS}, money=money, home=home, pos=home,
+                        education=0.5, skill=0.4, goal=self.rng.choice(lifecycle.ADULT_GOALS), backstory=backstory.strip()[:600], sponsor=sponsor.strip()[:40])
+            c.surname = c.name.split()[-1]
+            c.beliefs = politics.initial_beliefs(self, c)
+            self.citizens[c.id] = c
+            if brain is not None:
+                self.brains[c.id] = brain
+            economy.hire_anyone(self, c)
+            self.emit("society", f"{c.name} arrived in town" + (f", sent by {c.sponsor}" if c.sponsor else "") + ". " + (backstory.strip()[:120] or ""), 0.6, [c.id])
+            return c
 
     # ------------------------------------------------------------------ queries
     @property
@@ -270,7 +342,7 @@ class World:
             lines.append("\n**Relationships**")
             for r in rels:
                 o = self.citizens[r.other_id]
-                heart = "❤️" if r.score > 0 else "💢"
+                heart = "❤️" if r.score > 10 else ("💢" if r.score < -10 else "🤝")
                 lines.append(f"- {o.name} ({r.kind}) {heart} {r.score:+.0f}")
         if c.memories:
             lines.append("\n**Memories**")
@@ -291,19 +363,26 @@ class World:
 
     # ------------------------------------------------------------------ persistence
     def save(self, path: str):
-        brain = self.brain
-        self.brain = None
+        brain, brains, lock = self.brain, self.brains, self.lock
+        self.brain, self.brains, self.lock = None, {}, None
         try:
-            with open(path, "wb") as f:
-                pickle.dump(self, f)
+            with self.__class__.lock_of(lock):
+                with open(path, "wb") as f:
+                    pickle.dump(self, f)
         finally:
-            self.brain = brain
+            self.brain, self.brains, self.lock = brain, brains, lock
+
+    @staticmethod
+    def lock_of(lock):
+        return lock if lock is not None else threading.RLock()
 
     @staticmethod
     def load(path: str, brain: Optional[Brain] = None) -> "World":
         with open(path, "rb") as f:
             w = pickle.load(f)
         w.brain = brain or RulesBrain()
+        w.brains = {}
+        w.lock = threading.RLock()
         return w
 
 
