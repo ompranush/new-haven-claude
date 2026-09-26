@@ -356,3 +356,41 @@ def test_prune_never_touches_an_adopted_person():
     assert w.citizens[mine.id].memories, "an adopted person's diary was wiped"
     ordinary = [c for c in w.citizens.values() if not c.alive and not c.sponsor]
     assert ordinary and all(not c.memories for c in ordinary), "ordinary dead should be stripped"
+
+
+def test_line_passes_to_an_heir(tmp_path, monkeypatch):
+    """When a steward's person dies, a child can carry on: sponsorship, mind and claim token all move."""
+    monkeypatch.setenv("APP_SECRET", "t")
+    from civilisation.persistence import SQLiteStore
+    from civilisation.brains import RulesBrain
+    from civilisation.systems.lifecycle import die, make_child
+    store = SQLiteStore(str(tmp_path / "h.db"))
+    w = World(seed=21, population=60)
+    w.step(200)
+    mine = w.adopt("Ada Line", "F", 30, {}, "The first of us.", sponsor="om", brain=RulesBrain())
+    partner = next(c for c in w.alive() if c.id != mine.id and not c.spouse_id and c.age_on(w.day) >= 22)
+    mine.spouse_id, partner.spouse_id = partner.id, mine.id
+    kid = make_child(w, mine, partner)
+    store.write_resident("v", {"citizen_id": mine.id, "name": mine.name, "sponsor": "om", "provider": "anthropic",
+                               "model": "claude-opus-5", "enc_key": None, "max_calls": 200, "token_hash": "TOKEN"})
+    w.step(365 * 20)                                  # the child grows up
+    die(w, mine, "old age")
+    heirs = w.heirs_of(mine.id)
+    assert kid.id in [h.id for h in heirs]
+    w.inherit(mine.id, kid.id)
+    assert kid.sponsor == "om" and kid.id in w.brains and mine.id not in w.brains
+    assert any("is gone" in m.text for m in kid.memories)
+    store.transfer_resident("v", mine.id, kid.id, kid.name)
+    rows = store.read_residents("v")
+    assert len(rows) == 1 and rows[0]["citizen_id"] == kid.id and rows[0]["token_hash"] == "TOKEN"
+
+
+def test_relative_arrives_when_no_heirs():
+    from civilisation.systems.lifecycle import die
+    w = World(seed=22, population=50)
+    w.step(150)
+    mine = w.adopt("Solo Vance", "M", 40, {}, "No family here.", sponsor="om")
+    die(w, mine, "a fall")
+    assert not w.heirs_of(mine.id)
+    rel = w.adopt_relative(mine.id)
+    assert rel.surname == mine.surname and rel.sponsor == "om" and rel.alive

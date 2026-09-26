@@ -91,6 +91,7 @@ Because the snapshot is a whole-world copy, the world must stay finite: `World.p
 | `personality.py` · `eras.py` · `names.py` · `terrain.py` | flavour and parameters |
 | `brains.py` · `llm.py` · `providers.py` | cognition contract, LLM brain and narrator, provider backends |
 | `commands.py` · `presets.py` · `person.py` | decree language, shock catalogue, steward actions |
+| `World.heirs_of` / `inherit` / `adopt_relative` | succession: a steward's line passes to a child (or a relative) with the same claim token |
 | `chronicle.py` · `experiments.py` | documentary generator, scenario runner |
 | `scene.py` · `iso.py` | renderers |
 | `persistence.py` · `security.py` | store, recorder, signing, escaping, URL policy, limiters |

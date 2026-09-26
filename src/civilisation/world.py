@@ -278,6 +278,40 @@ class World:
                           f"unemployment {self.unemployment*100:.0f}%, inequality (Gini) {self.gini:.2f}.", 0.35)
         self.gdp_year = 0.0
 
+    def heirs_of(self, cid: int) -> List[Citizen]:
+        """Living children of a citizen, eldest first — whoever could carry on their line."""
+        c = self.citizens.get(cid)
+        if not c:
+            return []
+        kids = [self.citizens[k] for k in c.children if k in self.citizens and self.citizens[k].alive]
+        return sorted(kids, key=lambda x: -x.age_on(self.day))
+
+    def inherit(self, dead_id: int, heir_id: int) -> Citizen:
+        """A steward's line passes to one of their children: the sponsorship, the mind, the story."""
+        with self.lock:
+            dead, heir = self.citizens[dead_id], self.citizens[heir_id]
+            heir.sponsor = dead.sponsor or "anonymous"
+            parent_word = "mother" if dead.sex == "F" else "father"
+            heir.backstory = (f"Child of {dead.name}. {dead.backstory}".strip())[:600]
+            if dead_id in self.brains:
+                self.brains[heir_id] = self.brains.pop(dead_id)      # the same mind, the next generation
+            heir.remember(self.day, f"My {parent_word} {dead.name} is gone. Whatever they were to this town, it falls to me now.",
+                          "grief", 0.9, [dead_id], tag="life")
+            self.emit("society", f"{heir.name} took up {dead.name}'s place in {self.name}.", 0.6, [heir.id], tone="good")
+            return heir
+
+    def adopt_relative(self, dead_id: int) -> Citizen:
+        """No children left: a relative of the same name arrives to carry the line on."""
+        dead = self.citizens[dead_id]
+        sex = self.rng.choice("FM")
+        relation = self.rng.choice(["niece" if sex == "F" else "nephew", "cousin", "younger sibling"])
+        c = self.adopt(self.new_name(sex, dead.surname), sex, self.rng.randint(20, 34), dead.personality,
+                       backstory=f"{dead.name}'s {relation}, come to take over the family's place. {dead.backstory}".strip()[:600],
+                       sponsor=dead.sponsor or "anonymous")
+        if dead_id in self.brains:
+            self.brains[c.id] = self.brains.pop(dead_id)
+        return c
+
     def inject(self, name: str, **kwargs):
         """God mode. See disasters.INJECTABLE for names."""
         with self.lock:

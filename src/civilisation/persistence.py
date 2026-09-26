@@ -82,6 +82,7 @@ class Store:
     name = "none"
 
     def update_resident(self, village, citizen_id, **fields): ...
+    def transfer_resident(self, village, old_id, new_id, name): ...
 
     def write_metrics(self, village, rows): ...
     def write_events(self, village, rows): ...
@@ -164,6 +165,19 @@ class SQLiteStore(Store):
         with self.lock, self._conn() as c:
             c.execute(f"update residents set {', '.join(k + '=?' for k in fields)} where village=? and citizen_id=?", (*fields.values(), village, citizen_id))
 
+    def transfer_resident(self, village, old_id, new_id, name):
+        """Carry a claim token (and its settings) over to the heir."""
+        with self.lock, self._conn() as c:
+            cols = ", ".join(self.RES_COLS)
+            row = c.execute(f"select {cols} from residents where village=? and citizen_id=?", (village, old_id)).fetchone()
+            if not row:
+                return
+            d = dict(zip(self.RES_COLS, row))
+            d["citizen_id"], d["name"] = new_id, name
+            c.execute(f"insert or replace into residents (village, {cols}) values (?,?,?,?,?,?,?,?,?,?,?)",
+                      (village, *[d[k] for k in self.RES_COLS]))
+            c.execute("delete from residents where village=? and citizen_id=?", (village, old_id))
+
     def write_snapshot(self, village, day, blob):
         from .security import sign_blob
         with self.lock, self._conn() as c:
@@ -238,6 +252,15 @@ class SupabaseStore(Store):
         fields = {k: v for k, v in fields.items() if k in self.RES_COLS}
         if fields:
             self.client.table("residents").update(fields).eq("village", village).eq("citizen_id", citizen_id).execute()
+
+    def transfer_resident(self, village, old_id, new_id, name):
+        rows = self.client.table("residents").select(",".join(self.RES_COLS)).eq("village", village).eq("citizen_id", old_id).execute().data
+        if not rows:
+            return
+        d = dict(rows[0])
+        d["citizen_id"], d["name"] = new_id, name
+        self.client.table("residents").upsert({"village": village, **d}).execute()
+        self.client.table("residents").delete().eq("village", village).eq("citizen_id", old_id).execute()
 
     def write_snapshot(self, village, day, blob):
         from .security import sign_blob

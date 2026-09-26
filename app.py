@@ -249,7 +249,8 @@ def claim_person(token: str) -> bool:
 
 def welcome_screen():
     alive_now = w.alive()
-    residents = [c for c in w.citizens.values() if c.sponsor and c.alive]
+    sponsored_all = [c for c in w.citizens.values() if c.sponsor]
+    residents = [c for c in sponsored_all if c.alive]
     movements = [m for m in w.movements.values() if m.alive]
     st.markdown(f"""<div style="text-align:center;padding:26px 0 4px 0">
       <div style="font-size:40px;line-height:1">🌲</div>
@@ -261,7 +262,7 @@ def welcome_screen():
       <div style="color:#c9d3df;font-size:14px;margin-top:16px">
         <b>{esc(display_year(w))}</b> · day {w.day:,} · <b>{len(alive_now)}</b> people ·
         <b>{len(w.open_businesses())}</b> businesses · <b>{len(movements)}</b> movements ·
-        <b>{len(residents)}</b> brought here by visitors
+        <b>{len(sponsored_all)}</b> brought here by visitors{f" ({len(residents)} living)" if len(sponsored_all) != len(residents) else ""}
       </div></div>""", unsafe_allow_html=True)
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     a, b, c_ = st.columns(3)
@@ -824,8 +825,41 @@ try:
               if ss.get("steward_token"):
                   st.info(f"Your claim token — keep it, it is the only way back to {c.name.split()[0]} from another device:\n\n`{ss.steward_token}`\n\nPaste it into the claim box when you return (avoid putting it in a URL you might share).")
               if not c.alive:
-                  st.error(f"{c.name} died on day {c.died_day} of {c.cause_of_death}. You can move a new person in.")
-                  if st.button("Let them go"):
+                  st.error(f"{c.name} died on day {c.died_day:,} of {c.cause_of_death}, aged {c.age_on(c.died_day)}.")
+                  with st.expander(f"Read {c.name.split()[0]}'s life", expanded=False):
+                      st.markdown(w.biography(rid))
+
+                  def take_over(new_id, label):
+                      ss.resident_id = new_id
+                      ss.selected = new_id
+                      if PUBLIC:
+                          try:
+                              shared["store"].transfer_resident(VILLAGE, rid, new_id, w.citizens[new_id].name)
+                              shared["residents"][new_id] = w.citizens[new_id].sponsor
+                              shared["residents"].pop(rid, None)
+                              shared["recorder"].flush(w, force_snapshot=True)
+                          except Exception as e:
+                              st.warning(f"Carried over here but not saved to the store: {scrub(e)}")
+                      st.toast(label, icon="🕯️")
+                      st.rerun()
+
+                  heirs = w.heirs_of(rid)
+                  if heirs:
+                      st.markdown("**Your line continues.** Their children are still here — choose who carries it on. "
+                                  "Your claim token stays the same.")
+                      for h in heirs[:6]:
+                          emp = w.businesses.get(h.employer_id) if h.employer_id else None
+                          if st.button(f"Continue as {h.name} · {h.age_on(w.day)} · {job_label(w, h.job)}{' at ' + emp.name if emp else ''}",
+                                       key=f"heir_{h.id}", use_container_width=True, type="primary"):
+                              w.inherit(rid, h.id)
+                              take_over(h.id, f"{h.name} carries the line on.")
+                  else:
+                      st.markdown("**They left no living children.** A relative could come and take up the family's place — "
+                                  "same name, same claim token.")
+                      if st.button("Send for a relative", use_container_width=True, type="primary"):
+                          new = w.adopt_relative(rid)
+                          take_over(new.id, f"{new.name} arrived to take up the name.")
+                  if st.button("Let the line end (move someone new in instead)"):
                       ss.resident_id = None; ss.steward_token = None; st.rerun()
               else:
                   emp = w.businesses.get(c.employer_id) if c.employer_id else None
