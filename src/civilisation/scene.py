@@ -15,6 +15,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 let D = __DATA__;
 const T = D.codes;
 const URL = "__URL__";
+const HERO = __HERO__;   // backdrop mode: no input, a slow cinematic orbit
 const wrap = document.getElementById('wrap'), tip = document.getElementById('tip');
 
 // ---------------------------------------------------------------- renderer, scene, camera
@@ -35,6 +36,10 @@ camera.position.set(TC[0] + 19, 17, TC[1] + 19);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(TC[0], 0.5, TC[1]); controls.enableDamping = true; controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI / 2.25; controls.minDistance = 8; controls.maxDistance = 110;
+if (HERO) {
+  camera.position.set(TC[0] + 26, 15, TC[1] + 26); controls.target.set(TC[0], 0, TC[1]);
+  controls.enabled = false; controls.autoRotate = true; controls.autoRotateSpeed = 0.35;
+}
 controls.update();
 
 const hemi = new THREE.HemisphereLight('#dbe9f7', '#4a5a3a', 0.95); scene.add(hemi);
@@ -325,7 +330,7 @@ function loop(now) {
   daylight(now / 1000); animatePeople(now); animateSmoke(dt); animateAnimals(dt, now);
   clouds.forEach(c => { c.position.x += c.userData.v * dt; if (c.position.x > W + 12) c.position.x = -12; });
   water.material.emissiveIntensity = 0.2 + 0.08 * Math.sin(now / 900);
-  controls.update(); hover(); renderer.render(scene, camera); requestAnimationFrame(loop);
+  controls.update(); if (!HERO) hover(); renderer.render(scene, camera); requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
 let lastDay = D.day, lastSel = D.sel;
@@ -347,11 +352,17 @@ canvas{display:block;width:100%;height:100%}
 #hint{position:absolute;right:10px;bottom:8px;color:#8b98a8;font-size:11px;z-index:2}
 </style>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
-</head><body><div id="wrap"><div id="tip"></div><div id="hint">drag to orbit · scroll to zoom · right-drag to pan · hover for names</div></div>
+</head><body><div id="wrap"><div id="tip"></div><div id="hint">drag to orbit · scroll to zoom · right-drag to pan · hover for names</div>__OVERLAY__</div>
 <script type="module">__JS__</script></body></html>"""
 
 
-def render_html(world, selected=None, height: int = 620, url: str = "") -> str:
+def render_html(world, selected=None, height: int = 620, url: str = "", overlay: str = "") -> str:
+    """The village scene. With `overlay` (trusted, pre-escaped HTML) it becomes a non-interactive
+    backdrop that slowly orbits the town, with the overlay laid over it."""
     payload = world_payload(world, selected)
     payload["sel"] = selected
-    return HTML.replace("__H__", str(height)).replace("__JS__", JS.replace("__DATA__", json.dumps(payload)).replace("__URL__", url))
+    html = HTML.replace("__H__", str(height)).replace("__OVERLAY__", overlay)
+    if overlay:
+        html = html.replace('<div id="hint">drag to orbit · scroll to zoom · right-drag to pan · hover for names</div>', "")
+    js = JS.replace("__DATA__", json.dumps(payload)).replace("__URL__", url).replace("__HERO__", "true" if overlay else "false")
+    return html.replace("__JS__", js)

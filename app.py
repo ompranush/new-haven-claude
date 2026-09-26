@@ -247,58 +247,116 @@ def claim_person(token: str) -> bool:
     return False
 
 
+FONTS = '<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
+
+HERO_CSS = """<style>
+#hero{position:absolute;inset:0;z-index:3;pointer-events:none;display:flex;flex-direction:column;justify-content:flex-end;
+  padding:0 clamp(20px,5vw,56px) clamp(22px,4vw,40px);font-family:Inter,system-ui,sans-serif;color:#e6edf3;
+  background:linear-gradient(180deg,rgba(11,18,32,.25) 0%,rgba(11,18,32,0) 28%,rgba(11,18,32,.5) 60%,rgba(11,18,32,.97) 100%),
+             linear-gradient(90deg,rgba(11,18,32,.75) 0%,rgba(11,18,32,0) 65%)}
+#hero .live{display:inline-flex;align-items:center;gap:9px;width:max-content;font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+  color:#d5e4f7;background:rgba(15,23,42,.55);border:1px solid rgba(148,163,184,.25);backdrop-filter:blur(6px);padding:6px 13px;border-radius:999px}
+#hero .dot{width:7px;height:7px;border-radius:50%;background:#4ade80;animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.7)}70%{box-shadow:0 0 0 8px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
+#hero h1{font-family:Fraunces,Georgia,serif;font-weight:700;font-size:clamp(40px,7vw,78px);line-height:.95;letter-spacing:-.02em;
+  margin:16px 0 14px;color:#fff;text-shadow:0 2px 30px rgba(0,0,0,.45)}
+#hero .lede{max-width:600px;font-size:clamp(14px,1.5vw,17px);line-height:1.6;color:#cdd6e1;margin:0 0 22px}
+#hero .stats{display:flex;flex-wrap:wrap;gap:8px}
+#hero .s{background:rgba(15,23,42,.6);border:1px solid rgba(148,163,184,.18);backdrop-filter:blur(8px);border-radius:12px;padding:8px 14px;min-width:80px}
+#hero .s b{display:block;font-size:20px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums;line-height:1.2}
+#hero .s span{font-size:10.5px;color:#93a1b3;text-transform:uppercase;letter-spacing:.09em}
+@media (max-width:560px){#hero .s{padding:6px 10px;min-width:0}#hero .s b{font-size:16px}#hero .lede{margin-bottom:14px}}
+</style>"""
+
+WELCOME_CSS = """<style>
+  .block-container{max-width:1180px !important;margin:0 auto}
+  [class*="st-key-card_"]{background:linear-gradient(180deg,#15203a 0%,#111a2a 100%);border:1px solid #22304a;border-radius:18px;
+    padding:22px 22px 20px;gap:0.35rem;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+  [class*="st-key-card_"]:hover{transform:translateY(-3px);border-color:#34507a;box-shadow:0 14px 34px -14px rgba(0,0,0,.6)}
+  [data-testid="stLayoutWrapper"]:has(> [class*="st-key-card_"]){flex:1}
+  [class*="st-key-card_"]{height:100%}
+  [class*="st-key-card_"] > div:last-child{margin-top:auto}
+  .st-key-card_watch{border-color:#2c4a7c;background:linear-gradient(180deg,#172a4d 0%,#111a2a 100%)}
+  .nh-ic{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:12px}
+  .nh-t{font-family:Fraunces,Georgia,serif;font-size:22px;font-weight:600;color:#fff;letter-spacing:-.01em;margin-bottom:6px}
+  .nh-d{font-family:Inter,system-ui,sans-serif;font-size:14px;line-height:1.55;color:#9fb0c3;min-height:4.7em;margin-bottom:10px}
+  [class*="st-key-card_"] button{border-radius:11px;font-weight:600;padding:.55rem 1rem}
+  .nh-kicker{font-family:Inter,system-ui,sans-serif;font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:#7aa2f7;margin:30px 0 10px}
+  .nh-feed{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
+  .nh-feed div{font-family:Inter,system-ui,sans-serif;font-size:13.5px;line-height:1.5;color:#cdd6e1;background:#0f1726;border:1px solid #1c2940;
+    border-left:3px solid #3b82f6;border-radius:10px;padding:10px 13px}
+  .nh-feed b{display:block;font-size:11px;font-weight:600;color:#7aa2f7;letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+  .st-key-private_strip{margin-top:26px;background:#0f1726;border:1px dashed #2a3a55;border-radius:16px;padding:16px 20px}
+  .nh-p{font-family:Inter,system-ui,sans-serif;font-size:14px;line-height:1.55;color:#9fb0c3}
+  .nh-p b{color:#e6edf3}
+  .nh-foot{font-family:Inter,system-ui,sans-serif;text-align:center;color:#5d6b7e;font-size:12px;margin:28px 0 8px}
+</style>"""
+
+
 def welcome_screen():
     alive_now = w.alive()
     sponsored_all = [c for c in w.citizens.values() if c.sponsor]
     residents = [c for c in sponsored_all if c.alive]
     movements = [m for m in w.movements.values() if m.alive]
-    st.markdown(f"""<div style="text-align:center;padding:26px 0 4px 0">
-      <div style="font-size:40px;line-height:1">🌲</div>
-      <div style="font-size:32px;font-weight:800;color:#fff;letter-spacing:-0.5px">{esc(w.name)}</div>
-      <div style="color:#8b98a8;font-size:15px;max-width:660px;margin:10px auto 0 auto;line-height:1.6">
-        A village that has been running since its founding and never stops. Its people work, fall out, marry,
-        form political parties and go hungry entirely on their own — nobody writes the story in advance.
-      </div>
-      <div style="color:#c9d3df;font-size:14px;margin-top:16px">
-        <b>{esc(display_year(w))}</b> · day {w.day:,} · <b>{len(alive_now)}</b> people ·
-        <b>{len(w.open_businesses())}</b> businesses · <b>{len(movements)}</b> movements ·
-        <b>{len(sponsored_all)}</b> brought here by visitors{f" ({len(residents)} living)" if len(sponsored_all) != len(residents) else ""}
-      </div></div>""", unsafe_allow_html=True)
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    a, b, c_ = st.columns(3)
-    with a:
-        with st.container(border=True):
-            st.markdown("#### 👁 Watch the village")
-            st.caption("Follow the town as it lives: the map, its people, the economy, politics and the chronicle. Nothing to sign up for.")
-            if st.button("Enter", use_container_width=True, type="primary"):
-                ss.welcomed = True
-                st.rerun()
-    with b:
-        with st.container(border=True):
-            st.markdown("#### 🏡 Move your own person in")
-            st.caption("Invent someone — a name, a temperament, a past. Let them live by the rules, or bring your own LLM key and let your model be their mind.")
-            if st.button("Create a person", use_container_width=True):
-                ss.welcomed = True
-                ss.nav = "🏡 Move in"
-                st.rerun()
-    with c_:
-        with st.container(border=True):
-            st.markdown("#### 🔑 Come back to your person")
-            st.caption("Paste the claim token you were given when they moved in.")
-            with st.form("welcome_claim", clear_on_submit=False, border=False):
-                tok = st.text_input("Claim token", type="password", label_visibility="collapsed", placeholder="claim token", max_chars=100)
-                if st.form_submit_button("Claim", use_container_width=True) and claim_person(tok):
+    st.markdown(FONTS + WELCOME_CSS, unsafe_allow_html=True)
+
+    stats = [(f"{len(alive_now):,}", "people"), (f"{len(w.open_businesses()):,}", "businesses"),
+             (f"{len(movements):,}", "movements"), (f"{w.day // 365:,}", "years old") if w.day >= 730 else (f"{w.day:,}", "days old")]
+    if sponsored_all:
+        stats.append((f"{len(residents):,}", "adopted"))
+    overlay = FONTS + HERO_CSS + f"""<div id="hero">
+      <div class="live"><i class="dot"></i>Live now · {esc(display_year(w))} · day {w.day:,}</div>
+      <h1>{esc(w.name)}</h1>
+      <div class="lede">A village that has been running since its founding and never stops. Its people work, fall out, marry,
+        form parties and go hungry entirely on their own. Nobody writes the story in advance.</div>
+      <div class="stats">{"".join(f'<div class="s"><b>{v}</b><span>{k}</span></div>' for v, k in stats)}</div>
+    </div>"""
+    if "hero_html" not in ss:              # built once per session: the iframe must not re-mount on every rerun
+        ss.hero_html = render_3d(w, None, height=520, overlay=overlay)
+    components.html(ss.hero_html, height=524)
+
+    cards = [("watch", "👁", "#1e3a8a", "Watch the village",
+              "Follow the town as it lives: the map, its people, the economy, politics and the chronicle. Nothing to sign up for."),
+             ("move", "🏡", "#14532d", "Move someone in",
+              "Invent a person with a name, a temperament and a past. Let them live by the rules, or give them your own model as a mind."),
+             ("claim", "🔑", "#713f12", "Return to your person",
+              "Already have someone living here? Paste the claim token you were given when they moved in.")]
+    cols = st.columns(3, gap="medium")
+    for col, (key, icon, tint, title, desc) in zip(cols, cards):
+        with col, st.container(key=f"card_{key}"):
+            st.markdown(f'<div class="nh-ic" style="background:{tint}66;border:1px solid {tint}">{icon}</div>'
+                        f'<div class="nh-t">{title}</div><div class="nh-d">{desc}</div>', unsafe_allow_html=True)
+            if key == "watch":
+                if st.button("Enter the village  →", use_container_width=True, type="primary"):
+                    ss.welcomed = True
                     st.rerun()
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    d, e = st.columns([3, 1])
-    d.caption("Or run a world of your own: a private civilisation where you control the weather, the economy and the fate of everyone in it. "
-              "It lives in your browser session only, and nobody else can see it.")
-    if e.button("🌍 Create a private world", use_container_width=True):
-        ss.mode = "private"
-        ss.welcomed = True
-        ss.playing = False
-        ss.pop("iso_html", None)
-        st.rerun()
+            elif key == "move":
+                if st.button("Create a person", use_container_width=True):
+                    ss.welcomed = True
+                    ss.nav = "🏡 Move in"
+                    st.rerun()
+            else:
+                with st.form("welcome_claim", clear_on_submit=False, border=False):
+                    tok = st.text_input("Claim token", type="password", label_visibility="collapsed", placeholder="Claim token", max_chars=100)
+                    if st.form_submit_button("Claim", use_container_width=True) and claim_person(tok):
+                        st.rerun()
+
+    notable = [e for e in w.events if e.importance >= 0.55][-4:][::-1]
+    if notable:
+        st.markdown('<div class="nh-kicker">Lately in the village</div><div class="nh-feed">'
+                    + "".join(f"<div><b>Day {e.day:,}</b>{esc(e.text)}</div>" for e in notable) + "</div>", unsafe_allow_html=True)
+
+    with st.container(key="private_strip"):
+        d, e = st.columns([3, 1], vertical_alignment="center")
+        d.markdown('<div class="nh-p"><b>Or run a world of your own.</b> A private civilisation where you control the weather, '
+                   "the economy and the fate of everyone in it. It lives in your browser session only.</div>", unsafe_allow_html=True)
+        if e.button("🌍 Create a private world", use_container_width=True):
+            ss.mode = "private"
+            ss.welcomed = True
+            ss.playing = False
+            ss.pop("iso_html", None)
+            st.rerun()
+    st.markdown('<div class="nh-foot">New Haven · an agent-based civilisation · no script, no ending</div>', unsafe_allow_html=True)
 
 
 w.lock.acquire()          # the public village ticks on another thread; hold it still while we draw
