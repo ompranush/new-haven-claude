@@ -108,21 +108,40 @@ class OpenAICompatibleBackend(Backend):
             raise BackendError("base URL can only be set for the custom provider")
         url = base_url or PROVIDERS.get(provider, ("", "", "", ""))[0] or None
         self.client = openai.OpenAI(api_key=api_key or ("ollama" if provider == "ollama" else None), base_url=url)
+        # Most providers take `max_tokens`; OpenAI's newer models require `max_completion_tokens`.
+        # We start with the common one and switch permanently the first time a model objects.
+        self._token_param = "max_tokens"
+
+    def _chat(self, messages, max_tokens: int, **extra):
+        """One chat completion, adapting to whichever token parameter this model accepts."""
+        def call(param, budget):
+            return self.client.chat.completions.create(model=self.model, messages=messages, **{param: budget}, **extra)
+
+        try:
+            return call(self._token_param, self._budget(max_tokens))
+        except self._mod.BadRequestError as e:
+            if "max_completion_tokens" in str(e) and self._token_param == "max_tokens":
+                self._token_param = "max_completion_tokens"
+                return call(self._token_param, self._budget(max_tokens))
+            raise
+
+    def _budget(self, max_tokens: int) -> int:
+        # Reasoning models spend part of the budget thinking, and that comes out of max_completion_tokens,
+        # so give them considerably more room or the visible answer comes back empty.
+        return max(4096, max_tokens * 4) if self._token_param == "max_completion_tokens" else max_tokens
 
     def json_call(self, system, user, schema, max_tokens=1024, effort="low"):
         # json_object mode is the widest-supported contract; the schema is spelled out in the prompt and validated after
         sys_prompt = system + "\n\nRespond with a single JSON object matching this JSON schema exactly, and nothing else:\n" + json.dumps(schema)
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model, max_tokens=max_tokens,
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
-                response_format={"type": "json_object"},
-            )
+            resp = self._chat([{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
+                              max_tokens, response_format={"type": "json_object"})
         except self._mod.APIError as e:
             from .security import scrub
             raise BackendError(scrub(f"{type(e).__name__}: {e}")) from e
-        text = resp.choices[0].message.content or ""
-        text = text.strip()
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            raise BackendError(f"{self.model} returned no content (a reasoning model may have spent the whole token budget thinking)")
         if text.startswith("```"):
             text = text.strip("`").split("\n", 1)[-1].rsplit("```", 1)[0]
         try:
@@ -136,8 +155,11 @@ class OpenAICompatibleBackend(Backend):
         return data, Usage(getattr(u, "prompt_tokens", 0) or 0, getattr(u, "completion_tokens", 0) or 0, 0)
 
     def text_call(self, system, user, max_tokens=4000):
-        resp = self.client.chat.completions.create(model=self.model, max_tokens=max_tokens,
-                                                   messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+        try:
+            resp = self._chat([{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens)
+        except self._mod.APIError as e:
+            from .security import scrub
+            raise BackendError(scrub(f"{type(e).__name__}: {e}")) from e
         return resp.choices[0].message.content or ""
 
 

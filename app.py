@@ -118,13 +118,13 @@ def new_world(seed, pop, llm, era="medieval"):
     return World(seed=seed, population=pop, width=52, height=34, brain=brain, config={"era": era})
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Joining the public village…")
 def shared_village():
     """One village for everyone on this server. It ticks on its own thread, persists to the store,
     and restores itself (people, history, sponsored minds) after a restart."""
     from civilisation.llm import LLMBrain
     store = get_store(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "newhaven.db"))
-    state = {"running": True, "tick_seconds": float(os.environ.get("TICK_SECONDS", 4)), "days_per_tick": 1, "error": "", "residents": {},
+    state = {"running": True, "tick_seconds": float(os.environ.get("TICK_SECONDS", 60)), "days_per_tick": int(os.environ.get("DAYS_PER_TICK", 1)), "error": "", "residents": {},
              "store": store, "restored": False, "notes": []}
     w = None
     try:
@@ -149,6 +149,8 @@ def shared_village():
         for r in store.read_residents(VILLAGE):
             cid = int(r["citizen_id"])
             state["residents"][cid] = r.get("sponsor") or "anonymous"
+            if cid in w.citizens and not w.citizens[cid].sponsor:
+                w.citizens[cid].sponsor = r.get("sponsor") or "anonymous"   # backfill people who moved in before this was required
             key = decrypt_key(r.get("enc_key"))
             if cid in w.citizens and w.citizens[cid].alive and (key or r["provider"] in ("ollama", "custom")):
                 try:
@@ -161,8 +163,13 @@ def shared_village():
     if w.brain is None:
         from civilisation.brains import RulesBrain
         w.brain = RulesBrain()
-    rec = Recorder(store, VILLAGE, snapshot_every=int(os.environ.get("SNAPSHOT_EVERY_DAYS", 30)))
-    rec.prime(w)
+    rec = Recorder(store, VILLAGE,
+                   snapshot_every=int(os.environ.get("SNAPSHOT_EVERY_DAYS", 365)),
+                   write_interval=float(os.environ.get("WRITE_INTERVAL_SECONDS", 30)),
+                   snapshot_interval=float(os.environ.get("SNAPSHOT_INTERVAL_SECONDS", 900)),
+                   max_snapshot_mb=float(os.environ.get("MAX_SNAPSHOT_MB", 8)),
+                   min_importance=float(os.environ.get("STORE_MIN_IMPORTANCE", 0)))
+    rec.prime(w, restored=state["restored"])
     state["recorder"] = rec
 
     def loop():
@@ -193,7 +200,7 @@ if "world" not in ss:
     ss.speed = "1 day / sec"
     ss.selected = None
     ss.last_tick = 0.0
-    ss.mode = "private"
+    ss.mode = os.environ.get("DEFAULT_MODE", "public")
 PUBLIC = ss.get("mode") == "public"
 shared = shared_village() if PUBLIC else None
 w: World = shared["world"] if PUBLIC else ss.world
@@ -209,10 +216,89 @@ if PUBLIC and st.query_params.get("claim") and not ss.get("resident_id"):
         for r in shared["store"].read_residents(VILLAGE):
             if r.get("token_hash") == th and int(r["citizen_id"]) in w.citizens:
                 ss.resident_id = int(r["citizen_id"]); ss.steward_token = tok; ss.selected = ss.resident_id
+                ss.welcomed = True
+                ss.nav = "🏡 Move in"
                 break
     st.query_params.clear()
+def claim_person(token: str) -> bool:
+    """Attach this session to an existing resident. True on success."""
+    if not (PUBLIC and token.strip()):
+        return False
+    if not limiters()["claim"].allow(ss.sid):
+        st.error("Too many attempts. Try again later.")
+        return False
+    limiters()["claim"].hit(ss.sid)
+    th = token_hash(clean_text(token, 100))
+    hit = next((r for r in shared["store"].read_residents(VILLAGE) if r.get("token_hash") == th), None)
+    if hit and int(hit["citizen_id"]) in w.citizens:
+        ss.resident_id = int(hit["citizen_id"])
+        ss.steward_token = token.strip()
+        ss.selected = ss.resident_id
+        ss.welcomed = True
+        ss.nav = "🏡 Move in"
+        return True
+    st.error("No person matches that token.")
+    return False
+
+
+def welcome_screen():
+    alive_now = w.alive()
+    residents = [c for c in w.citizens.values() if c.sponsor and c.alive]
+    movements = [m for m in w.movements.values() if m.alive]
+    st.markdown(f"""<div style="text-align:center;padding:26px 0 4px 0">
+      <div style="font-size:40px;line-height:1">🌲</div>
+      <div style="font-size:32px;font-weight:800;color:#fff;letter-spacing:-0.5px">{esc(w.name)}</div>
+      <div style="color:#8b98a8;font-size:15px;max-width:660px;margin:10px auto 0 auto;line-height:1.6">
+        A village that has been running since its founding and never stops. Its people work, fall out, marry,
+        form political parties and go hungry entirely on their own — nobody writes the story in advance.
+      </div>
+      <div style="color:#c9d3df;font-size:14px;margin-top:16px">
+        <b>{esc(display_year(w))}</b> · day {w.day:,} · <b>{len(alive_now)}</b> people ·
+        <b>{len(w.open_businesses())}</b> businesses · <b>{len(movements)}</b> movements ·
+        <b>{len(residents)}</b> brought here by visitors
+      </div></div>""", unsafe_allow_html=True)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    a, b, c_ = st.columns(3)
+    with a:
+        with st.container(border=True):
+            st.markdown("#### 👁 Watch the village")
+            st.caption("Follow the town as it lives: the map, its people, the economy, politics and the chronicle. Nothing to sign up for.")
+            if st.button("Enter", use_container_width=True, type="primary"):
+                ss.welcomed = True
+                st.rerun()
+    with b:
+        with st.container(border=True):
+            st.markdown("#### 🏡 Move your own person in")
+            st.caption("Invent someone — a name, a temperament, a past. Let them live by the rules, or bring your own LLM key and let your model be their mind.")
+            if st.button("Create a person", use_container_width=True):
+                ss.welcomed = True
+                ss.nav = "🏡 Move in"
+                st.rerun()
+    with c_:
+        with st.container(border=True):
+            st.markdown("#### 🔑 Come back to your person")
+            st.caption("Paste the claim token you were given when they moved in.")
+            with st.form("welcome_claim", clear_on_submit=False, border=False):
+                tok = st.text_input("Claim token", type="password", label_visibility="collapsed", placeholder="claim token", max_chars=100)
+                if st.form_submit_button("Claim", use_container_width=True) and claim_person(tok):
+                    st.rerun()
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    d, e = st.columns([3, 1])
+    d.caption("Or run a world of your own: a private civilisation where you control the weather, the economy and the fate of everyone in it. "
+              "It lives in your browser session only, and nobody else can see it.")
+    if e.button("🌍 Create a private world", use_container_width=True):
+        ss.mode = "private"
+        ss.welcomed = True
+        ss.playing = False
+        ss.pop("iso_html", None)
+        st.rerun()
+
+
 w.lock.acquire()          # the public village ticks on another thread; hold it still while we draw
 try:
+  if PUBLIC and not ss.get("welcomed"):
+      welcome_screen()
+      st.stop()
   alive = w.alive()
   if not alive:
       ss.playing = False
@@ -240,6 +326,18 @@ try:
   h1, h2, h3, h4 = st.columns([1.5, 5.0, 0.8, 1.3])
   with h1:
       st.markdown('<div class="brand"><span style="font-size:34px">🌲</span><div><div class="t">New Haven</div><div class="s">An AI Civilisation Simulator</div></div></div>', unsafe_allow_html=True)
+  def pace_phrase(state) -> str:
+      """How fast time runs here, in words."""
+      per_min = 60.0 / max(0.1, state["tick_seconds"]) * state["days_per_tick"]
+      if per_min < 1:
+          return f"a day every {state['tick_seconds'] * state['days_per_tick'] / 60:.0f} minutes"
+      if per_min < 2:
+          return "a day every minute"
+      for days, label in ((7, "a week"), (30, "a month"), (365, "a year")):
+          if per_min < days * 2:
+              return f"about {label} every minute"
+      return f"{per_min / 365:.0f} years every minute"
+
   def brain_badge(w):
       b = w.brain
       mode = ('<span style="color:#8b5cf6">🏘️ Public village · </span>' + ('<span style="color:#eda100">⚡ you are god · </span>' if ss.get("is_god") else '<span style="color:#8b98a8">👁 visitor · </span>')) if PUBLIC else ""
@@ -265,7 +363,24 @@ try:
 
   with h3:
       st.fragment(run_every=tick_interval())(clock)()
-  st.markdown(f'<div style="font-size:12px;margin:-6px 0 6px 0;text-align:right">{brain_badge(w)}</div>', unsafe_allow_html=True)
+  badge_col, switch_col = st.columns([5, 1])
+  badge_col.markdown(f'<div style="font-size:12px;margin:-6px 0 6px 0;text-align:right">{brain_badge(w)}</div>', unsafe_allow_html=True)
+  with switch_col.popover("🏘️ Public" if PUBLIC else "🌍 Private", use_container_width=True):
+      st.caption("You are in the shared village that everyone sees." if PUBLIC else "You are in a private world of your own. Nobody else can see it.")
+      if PUBLIC:
+          if st.button("Switch to a private world", use_container_width=True):
+              ss.mode = "private"; ss.playing = False; ss.pop("iso_html", None); st.rerun()
+          if ss.get("resident_id") and ss.resident_id in w.citizens:
+              if st.button(f"Go to {w.citizens[ss.resident_id].name.split()[0]}", use_container_width=True, type="primary"):
+                  ss.nav = "🏡 Move in"; st.rerun()
+          else:
+              with st.form("hdr_claim", clear_on_submit=False, border=False):
+                  t = st.text_input("Claim token", type="password", label_visibility="collapsed", placeholder="claim token", max_chars=100)
+                  if st.form_submit_button("Claim my person", use_container_width=True) and claim_person(t):
+                      st.rerun()
+      else:
+          if st.button("Join the public village", use_container_width=True, type="primary"):
+              ss.mode = "public"; ss.playing = False; ss.pop("iso_html", None); st.rerun()
   with h4:
       b1, b2, b3 = st.columns(3)
       running = shared["running"] if PUBLIC else ss.playing
@@ -381,7 +496,7 @@ try:
           with st.container(border=True):
               st.markdown("<h4>Simulation Controls</h4>" + ("" if IS_GOD else "<div style='font-size:12px;color:#eda100'>🔒 Only the god of this village controls the civilisation. You control your own person on the Move in page.</div>"), unsafe_allow_html=True)
               if not IS_GOD:
-                  st.markdown(f"<div style='font-size:12px;color:#8b98a8'>Pace: 1 day every {shared['tick_seconds']:.0f}s · {'running' if shared['running'] else 'paused'}</div>", unsafe_allow_html=True)
+                  st.markdown(f"<div style='font-size:12px;color:#8b98a8'>Pace: {pace_phrase(shared)} · {'running' if shared['running'] else 'paused'}</div>", unsafe_allow_html=True)
               if not PUBLIC:
                   ss.speed = st.select_slider("Speed while playing", options=list(SPEEDS), value=ss.speed if ss.speed in SPEEDS else "1 day / sec")
               INJECTABLE = all_injectable(w)
@@ -690,18 +805,12 @@ try:
                           except Exception as e:
                               st.warning(f"Saved in memory but not to the store: {e}")
                       st.rerun()
-              st.markdown("#### Already have a person here?")
-              claim = st.text_input("Paste your claim token", type="password", key="claim_box", max_chars=100)
-              if st.button("Claim") and claim.strip() and PUBLIC:
-                  if not limiters()["claim"].allow(ss.sid):
-                      st.error("Too many attempts. Try again later."); st.stop()
-                  limiters()["claim"].hit(ss.sid)
-                  th = token_hash(claim.strip())
-                  hit = next((r for r in shared["store"].read_residents(VILLAGE) if r.get("token_hash") == th), None)
-                  if hit and int(hit["citizen_id"]) in w.citizens:
-                      ss.resident_id = int(hit["citizen_id"]); ss.steward_token = claim.strip(); ss.selected = ss.resident_id; st.rerun()
-                  else:
-                      st.error("No person matches that token.")
+              if PUBLIC:
+                  st.markdown("#### Already have a person here?")
+                  with st.form("moveinpage_claim", clear_on_submit=False, border=False):
+                      claim = st.text_input("Paste your claim token", type="password", max_chars=100)
+                      if st.form_submit_button("Claim") and claim_person(claim):
+                          st.rerun()
           else:
               c = w.citizens[rid]
               brain = w.brains.get(rid)
@@ -951,8 +1060,16 @@ try:
                           else:
                               st.error("Not today.")
           if PUBLIC and IS_GOD:
+              rst = shared["recorder"].stats()
               st.caption(f"Storage: **{shared['store'].status()}** · village '{VILLAGE}' · " + ("restored from snapshot · " if shared.get("restored") else "") +
-                         f"{shared['recorder'].writes} flushes" + (f" · notes: {scrub('; '.join(shared['notes']))}" if shared.get("notes") else ""))
+                         f"{rst['writes']} writes · {rst['snapshots']} snapshots (last {rst['last_snapshot_mb']} MB) · "
+                         f"{rst['throttled']} throttled · **{rst['dropped']} lost**"
+                         + (f" · notes: {scrub('; '.join(shared['notes']))}" if shared.get("notes") else ""))
+              if rst["last_error"]:
+                  st.error(f"store: {rst['last_error']}")
+              cit = len(w.citizens)
+              st.caption(f"World size: {cit} citizens on record ({len(w.alive())} alive), "
+                         f"{sum(len(c.relationships) for c in w.citizens.values()):,} relationships, {len(w.chronicle)} chronicle entries.")
               c1, c2 = st.columns(2)
               shared["tick_seconds"] = c1.slider("Seconds per day (public village)", 1.0, 30.0, float(shared["tick_seconds"]), 1.0)
               shared["days_per_tick"] = int(c2.select_slider("Days per tick", [1, 7, 30], value=shared["days_per_tick"]))

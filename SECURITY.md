@@ -19,7 +19,7 @@ New Haven holds other people's API keys, so this document is explicit about what
 | Brute-forcing the god password or claim tokens | `hmac.compare_digest`; per-session limiter (5 attempts / 15 min for the password with a delay, 10 for tokens); claim tokens are 144-bit random and stored as SHA-256 hashes |
 | An unlocked production village | With no `ADMIN_PASSWORD` on a production server (`RAILWAY_ENVIRONMENT`/`PRODUCTION` set) nobody is god; locally everyone is, with a warning |
 | Snapshot tampering → pickle RCE | Snapshots are HMAC-signed with `APP_SECRET`; unsigned or mismatched blobs are refused when a secret is set. Treat `APP_SECRET` and the Supabase service key as equally sensitive |
-| Database exposure | The SQLite fallback lives in `data/` (not the publicly served `static/`); Supabase tables have RLS enabled with no policies, so only the service-role key can read them, and that key exists only in the server environment |
+| Database exposure | The SQLite fallback lives in `data/` (not the publicly served `static/`); Supabase tables have RLS enabled with no policies, all privileges are granted to `service_role` only and explicitly revoked from `anon`/`authenticated` (now and by default in future), and the service-role key exists only in the server environment. Create the Supabase project with "Automatically expose new tables" **off** and "Enable automatic RLS" **on** |
 | Abuse of the host's LLM key | Decrees are god-only; host reactions are capped by `LLM_MAX_CALLS`; stewards' instructions run on their own keys with an 8-second cooldown; `MAX_RESIDENTS` caps the village |
 | Container | Runs as an unprivileged user; TLS is terminated by the platform (Railway) |
 

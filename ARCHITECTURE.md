@@ -66,6 +66,17 @@ Unknown ops are reported, never silently dropped.
 
 **Roles.** `IS_GOD` is true in a private world, or in the public village after the `ADMIN_PASSWORD` login (on a production server with no password set, nobody is god). Gods control play, pace, shocks, decrees and the host brain. Anyone can watch. A **steward** is someone holding a claim token for a citizen they moved in.
 
+## Persistence — what is a record and what is a save-game
+
+Two very different things go to the store, and confusing them is what nearly took the database down:
+
+- **The log** (`events`, `thoughts`, `metrics`) is the permanent record and is **append-only**: each flush writes only the rows created since the last one. Nothing is ever rewritten. Every interaction and every inner voice is kept by default (`STORE_MIN_IMPORTANCE=0`). The world's in-memory lists are rolling windows, so the recorder counts lifetime totals (`events_total`, `thoughts_total`) rather than list lengths, and reports `dropped` if a window ever wraps before a flush — that number must stay at zero.
+- **The snapshot** is a save-game, not a record: the whole world, pickled, gzipped and signed. It exists so a restart resumes the village rather than restarting it. It is written at most once per `SNAPSHOT_INTERVAL_SECONDS` **and** per `SNAPSHOT_EVERY_DAYS`, and refused above `MAX_SNAPSHOT_MB`. Losing one costs at most the minutes since the last; the log still has everything that happened.
+
+Because the snapshot is a whole-world copy, the world must stay finite: `World.prune()` runs each simulated year, stripping memories and relationships from the dead, forgetting stale acquaintances among the living, capping the in-memory history and chronicle, and deleting long-dead citizens that nothing references. Without it, relationships grow with the square of the population (157k by year 60) and the snapshot grows without limit.
+
+**Storage cost scales with simulated time, not real time.** A village produces ~2.2 log rows per simulated day, so rows per real day = 2.2 × (86400 / `TICK_SECONDS`). At `TICK_SECONDS=10` that is ~19k rows/day (~4 MB); at 30 it is ~6k (~1.4 MB). Slowing the clock is the cheapest way to make a complete record affordable.
+
 ## Persistence
 
 `persistence.py` exposes one `Store` interface with Supabase and SQLite implementations. A `Recorder` attached to the public village flushes new events, thoughts and metrics every tick and a full pickled snapshot every N days. On boot the village restores the latest snapshot, re-attaches sponsored brains (only for residents who opted to store an encrypted key), and primes the recorder so history isn't duplicated. Snapshots are HMAC-signed with `APP_SECRET`; unsigned or mismatched snapshots are refused when a secret is set.

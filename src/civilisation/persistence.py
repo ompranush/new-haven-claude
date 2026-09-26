@@ -15,9 +15,10 @@ import io
 import json
 import os
 import pickle
+import time
+import gzip
 import sqlite3
 import threading
-import time
 from dataclasses import asdict
 from typing import Optional
 
@@ -34,7 +35,21 @@ create index if not exists events_village_day on events (village, day desc);
 create index if not exists thoughts_village_day on thoughts (village, day desc);
 alter table metrics enable row level security;  alter table events enable row level security;  alter table thoughts enable row level security;
 alter table decrees enable row level security;  alter table residents enable row level security; alter table snapshots enable row level security;
--- no policies: only the service-role key (server side) can read or write.
+-- No policies are defined, so RLS denies everything to the browser-facing roles.
+
+-- The server uses the service_role key only; grant it explicitly so the project can keep
+-- "Automatically expose new tables" switched off.
+grant usage on schema public to service_role;
+grant all privileges on all tables in schema public to service_role;
+grant all privileges on all sequences in schema public to service_role;
+alter default privileges in schema public grant all on tables to service_role;
+alter default privileges in schema public grant all on sequences to service_role;
+
+-- Nothing at all for anon / authenticated, now or in future.
+revoke all on all tables in schema public from anon, authenticated;
+revoke all on all sequences in schema public from anon, authenticated;
+alter default privileges in schema public revoke all on tables from anon, authenticated;
+alter default privileges in schema public revoke all on sequences from anon, authenticated;
 """
 
 
@@ -267,52 +282,108 @@ def get_store(local_path: str = "data/newhaven.db") -> Store:
 
 # ---------------------------------------------------------------- recorder: hooks a world to a store
 class Recorder:
-    """Call `flush(world)` from the ticker; it writes only what is new since last time. Errors never propagate."""
+    """Call `flush(world)` from the ticker; it writes only what is new, and only as often as the
+    intervals allow. A simulation can run far faster than a database should be written to, so both
+    the row writes and the (compressed) snapshots are paced by wall-clock seconds. Errors never propagate."""
 
-    def __init__(self, store: Store, village: str, snapshot_every: int = 30):
+    def __init__(self, store: Store, village: str, snapshot_every: int = 30,
+                 write_interval: float = 30.0, snapshot_interval: float = 900.0, max_snapshot_mb: float = 8.0,
+                 min_importance: float = 0.0):
         self.store, self.village, self.snapshot_every = store, village, snapshot_every
+        self.write_interval = write_interval
+        self.snapshot_interval = snapshot_interval
+        self.max_snapshot_mb = max_snapshot_mb
+        self.min_importance = min_importance      # 0 keeps every event; raise it only to save space
+        self.dropped = 0                          # rows lost to buffer overflow (should always be 0)
         self.events_seen = 0
         self.thoughts_seen = 0
         self.metrics_day = -1
         self.last_snapshot_day = -1
+        self.last_write_at = 0.0
+        self.last_snapshot_at = 0.0
+        self.last_snapshot_mb = 0.0
         self.last_error = ""
         self.writes = 0
+        self.snapshots = 0
+        self.skipped = 0
 
-    def prime(self, world):
-        """Start from the world's current position (after a restore) so history isn't duplicated."""
-        self.events_seen = getattr(world, "events_total", len(world.events))
-        self.thoughts_seen = getattr(world, "thoughts_total", len(world.thoughts))
-        self.metrics_day = world.history[-1]["day"] if world.history else -1
+    def prime(self, world, restored: bool = True):
+        """Set the starting point. After a restore, skip what the store already has. For a brand-new
+        village, start from zero so even its founding moment is recorded."""
+        if restored:
+            self.events_seen = getattr(world, "events_total", len(world.events))
+            self.thoughts_seen = getattr(world, "thoughts_total", len(world.thoughts))
+            self.metrics_day = world.history[-1]["day"] if world.history else -1
+        else:
+            self.events_seen = self.thoughts_seen = 0
+            self.metrics_day = -1
         self.last_snapshot_day = world.day
+        self.last_write_at = self.last_snapshot_at = time.time()
 
     def flush(self, world, force_snapshot: bool = False):
+        now = time.time()
+        if not force_snapshot and now - self.last_write_at < self.write_interval:
+            self.skipped += 1
+            return
+        self.last_write_at = now
         try:
             total = getattr(world, "events_total", len(world.events))
             if total > self.events_seen:
-                new = world.events[-(total - self.events_seen):]
-                self.store.write_events(self.village, [asdict(e) for e in new])
+                want = total - self.events_seen
+                if want > len(world.events):                 # the rolling window wrapped before we got here
+                    self.dropped += want - len(world.events)
+                    self.last_error = (f"{self.dropped} events scrolled out of memory before they were stored — "
+                                       f"lower WRITE_INTERVAL_SECONDS or TICK_SECONDS")
+                new = world.events[-min(want, len(world.events)):]
+                if self.min_importance > 0:
+                    new = [e for e in new if e.importance >= self.min_importance]
+                if new:
+                    self.store.write_events(self.village, [asdict(e) for e in new])
                 self.events_seen = total
             ttotal = getattr(world, "thoughts_total", len(world.thoughts))
             if ttotal > self.thoughts_seen:
-                self.store.write_thoughts(self.village, world.thoughts[-(ttotal - self.thoughts_seen):])
+                want = ttotal - self.thoughts_seen
+                if want > len(world.thoughts):
+                    self.dropped += want - len(world.thoughts)
+                    self.last_error = (f"{self.dropped} inner voices scrolled out of memory before they were stored — "
+                                       f"lower WRITE_INTERVAL_SECONDS or TICK_SECONDS")
+                self.store.write_thoughts(self.village, world.thoughts[-min(want, len(world.thoughts)):])
                 self.thoughts_seen = ttotal
             rows = [r for r in world.history if r["day"] > self.metrics_day]
             if rows:
                 self.store.write_metrics(self.village, rows)
                 self.metrics_day = rows[-1]["day"]
-            if force_snapshot or world.day - self.last_snapshot_day >= self.snapshot_every:
-                buf = io.BytesIO()
-                brain, brains, lock = world.brain, world.brains, world.lock
-                world.brain, world.brains, world.lock = None, {}, None
-                try:
-                    pickle.dump(world, buf)
-                finally:
-                    world.brain, world.brains, world.lock = brain, brains, lock
-                self.store.write_snapshot(self.village, world.day, buf.getvalue())
-                self.last_snapshot_day = world.day
+            due = world.day - self.last_snapshot_day >= self.snapshot_every and now - self.last_snapshot_at >= self.snapshot_interval
+            if force_snapshot or due:
+                blob = gzip.compress(self._dump(world), 6)
+                self.last_snapshot_mb = len(blob) / 1e6
+                if self.last_snapshot_mb > self.max_snapshot_mb:
+                    self.last_error = (f"snapshot is {self.last_snapshot_mb:.1f} MB (limit {self.max_snapshot_mb} MB) — not stored. "
+                                       f"Raise MAX_SNAPSHOT_MB or let the world prune further.")
+                else:
+                    self.store.write_snapshot(self.village, world.day, blob)
+                    self.last_snapshot_day = world.day
+                    self.last_snapshot_at = now
+                    self.snapshots += 1
             self.writes += 1
         except Exception as e:
-            self.last_error = f"{type(e).__name__}: {e}"[:200]
+            from .security import scrub
+            self.last_error = scrub(f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _dump(world) -> bytes:
+        buf = io.BytesIO()
+        brain, brains, lock = world.brain, world.brains, world.lock
+        world.brain, world.brains, world.lock = None, {}, None
+        try:
+            pickle.dump(world, buf)
+        finally:
+            world.brain, world.brains, world.lock = brain, brains, lock
+        return buf.getvalue()
+
+    def stats(self) -> dict:
+        return {"writes": self.writes, "snapshots": self.snapshots, "throttled": self.skipped, "dropped": self.dropped,
+                "last_snapshot_mb": round(self.last_snapshot_mb, 2), "last_error": self.last_error}
 
 
 def restore_world(store: Store, village: str):
@@ -322,7 +393,10 @@ def restore_world(store: Store, village: str):
         return None
     from .brains import RulesBrain
     from .security import verify_blob
-    w = pickle.load(io.BytesIO(verify_blob(blob)))
+    raw = verify_blob(blob)
+    if raw[:2] == b"\x1f\x8b":          # gzip magic — snapshots written since compression was added
+        raw = gzip.decompress(raw)
+    w = pickle.load(io.BytesIO(raw))
     w.brain = RulesBrain()
     w.brains = {}
     w.lock = threading.RLock()

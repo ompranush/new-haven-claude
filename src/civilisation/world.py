@@ -153,10 +153,12 @@ class World:
         ev = WorldEvent(self.day, category, text, float(importance), list(actors or []), tone=tone)
         self.events.append(ev)
         self.events_total = getattr(self, "events_total", 0) + 1
-        if len(self.events) > 3000:
-            self.events = self.events[-3000:]
+        if len(self.events) > 20000:
+            self.events = self.events[-20000:]
         if importance >= self.config["chronicle_threshold"]:
             self.chronicle.append(ev)
+            if len(self.chronicle) > 1200:
+                self.chronicle = self.chronicle[-1200:]
         if importance >= self.config["brain_threshold"] and ev.actors:
             self._consult_brain(ev)
         return ev
@@ -182,8 +184,8 @@ class World:
     def think(self, c: Citizen, text: str, source: str = "rules", emotion: str = "neutral"):
         self.thoughts.append({"day": self.day, "cid": c.id, "name": c.name, "text": text, "source": source, "emotion": emotion})
         self.thoughts_total = getattr(self, "thoughts_total", 0) + 1
-        if len(self.thoughts) > 400:
-            self.thoughts = self.thoughts[-400:]
+        if len(self.thoughts) > 10000:
+            self.thoughts = self.thoughts[-10000:]
 
     # ------------------------------------------------------------------ stepping
     def step(self, days: int = 1):
@@ -223,7 +225,49 @@ class World:
             if self.day % 365 == 0:
                 self._year_end()
 
+    def prune(self):
+        """Keep the world's footprint finite: the dead keep their names but not their inner lives,
+        and the living forget people they barely knew. The full record lives in the store."""
+        keep_dead_days = 30 * 365
+        for c in self.citizens.values():
+            if not c.alive and (c.memories or c.relationships):
+                c.memories, c.relationships = [], {}      # a name, dates and a family line are enough
+        # anyone still pointed at by a family tie, a movement, the chronicle or a diary line must stay,
+        # or lookups elsewhere would break
+        referenced = set()
+        for c in self.citizens.values():
+            referenced.update(c.parent_ids)
+            referenced.update(c.children)
+            if c.spouse_id:
+                referenced.add(c.spouse_id)
+            referenced.update(c.relationships)
+        for m in self.movements.values():
+            referenced.add(m.founder_id)
+            referenced.update(m.members)
+        for e in self.chronicle:
+            referenced.update(e.actors)
+        for t in self.thoughts:
+            referenced.add(t["cid"])
+        if self.strike:
+            referenced.update(self.strike["members"])
+        gone = [c.id for c in self.citizens.values()
+                if not c.alive and c.id not in referenced and self.day - (c.died_day or 0) > keep_dead_days]
+        for cid in gone:
+            del self.citizens[cid]
+            self.brains.pop(cid, None)
+        for c in self.alive():
+            for oid, r in list(c.relationships.items()):
+                other = self.citizens.get(oid)
+                stale = self.day - r.last_interaction > 3 * 365
+                if other is None or (not other.alive and abs(r.score) < 60) or (stale and abs(r.score) < 20):
+                    del c.relationships[oid]
+        for m in list(self.movements.values()):
+            if not m.alive and self.day - m.founded_day > keep_dead_days:
+                del self.movements[m.id]
+        return len(gone)
+
     def _year_end(self):
+        self.prune()
         alive = self.alive()
         if not alive:
             self.emit("collapse", f"Year {self.year}: {self.name} is empty. The civilisation has ended.", 1.0)
@@ -242,6 +286,8 @@ class World:
         """A visitor moves their own person into the village, optionally with their own brain (and key)."""
         from .security import clean_text
         name, backstory, sponsor = clean_text(name, 40), clean_text(backstory, 600), clean_text(sponsor, 40)
+        named_sponsor = bool(sponsor)
+        sponsor = sponsor or "anonymous"      # always set, so adopted citizens are always countable
         sex = "F" if sex == "F" else "M"
         age = int(min(90, max(18, int(age))))
         with self.lock:
@@ -255,7 +301,7 @@ class World:
             if brain is not None:
                 self.brains[c.id] = brain
             economy.hire_anyone(self, c)
-            self.emit("society", f"{c.name} arrived in town" + (f", sent by {c.sponsor}" if c.sponsor else "") + ". " + (backstory.strip()[:120] or ""), 0.6, [c.id])
+            self.emit("society", f"{c.name} arrived in town" + (f", sent by {c.sponsor}" if named_sponsor else "") + ". " + (backstory.strip()[:120] or ""), 0.6, [c.id])
             return c
 
     # ------------------------------------------------------------------ queries
@@ -295,6 +341,8 @@ class World:
             "brain_calls": self.brain_calls,
         }
         self.history.append(row)
+        if len(self.history) > 2500:
+            self.history = self.history[-2500:]
 
     def metrics_df(self) -> pd.DataFrame:
         return pd.DataFrame(self.history)

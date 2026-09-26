@@ -246,3 +246,96 @@ def test_custom_provider_gated(monkeypatch):
         make_backend("openai", "gpt-5", api_key="k", base_url="https://evil.example/v1"); assert False
     except BackendError:
         pass
+
+
+def test_openai_token_param_adapts():
+    """OpenAI's newer models reject max_tokens; the backend must switch and remember."""
+    import types
+    import openai
+    from civilisation.providers import make_backend
+    seen = []
+
+    class Completions:
+        def create(self, **kw):
+            seen.append("max_completion_tokens" if "max_completion_tokens" in kw else "max_tokens")
+            if "max_tokens" in kw:
+                raise openai.BadRequestError("Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+                                             response=types.SimpleNamespace(status_code=400, headers={}, request=None), body=None)
+            return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content='{"ok": true}'))],
+                                         usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=2))
+
+    be = make_backend("openai", "gpt-5", api_key="test")
+    be.client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=Completions()))
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}
+    data, _ = be.json_call("sys", "user", schema, max_tokens=1024)
+    assert data == {"ok": True} and seen == ["max_tokens", "max_completion_tokens"]
+    be.json_call("sys", "user", schema, max_tokens=1024)
+    assert seen[-1] == "max_completion_tokens" and len(seen) == 3      # no repeated failed attempt
+
+
+def test_adopted_citizens_are_always_countable():
+    """A visitor who leaves the sponsor field blank must still show up as a resident."""
+    w = World(seed=7, population=30)
+    named = w.adopt("Ada One", "F", 30, {}, "x", sponsor="om")
+    anon = w.adopt("Bea Two", "F", 30, {}, "x", sponsor="")
+    assert named.sponsor == "om" and anon.sponsor == "anonymous"
+    assert len([c for c in w.citizens.values() if c.sponsor]) == 2
+    arrivals = [e.text for e in w.events if "arrived in town" in e.text]
+    assert any("sent by om" in t for t in arrivals) and not any("sent by anonymous" in t for t in arrivals)
+
+
+def test_prune_keeps_the_world_finite_and_intact():
+    """Long runs must not grow without bound, and every id a citizen points at must still resolve."""
+    w = World(seed=11, population=80)
+    w.step(365 * 12)
+    before = sum(len(c.relationships) for c in w.citizens.values())
+    w.prune()
+    after = sum(len(c.relationships) for c in w.citizens.values())
+    assert after <= before
+    assert all(not c.memories and not c.relationships for c in w.citizens.values() if not c.alive)
+    for c in w.citizens.values():
+        for k in list(c.parent_ids) + list(c.children) + ([c.spouse_id] if c.spouse_id else []):
+            assert k in w.citizens, f"dangling reference {c.id} -> {k}"
+    for m in w.movements.values():
+        assert m.founder_id in w.citizens
+    assert w.biography(w.alive()[0].id)
+    w.step(365)                                   # still runs afterwards
+
+
+def test_recorder_paces_writes_and_compresses(tmp_path, monkeypatch):
+    import gzip
+    monkeypatch.setenv("APP_SECRET", "t")
+    from civilisation.persistence import SQLiteStore, Recorder, restore_world
+    store = SQLiteStore(str(tmp_path / "p.db"))
+    rec = Recorder(store, "v", snapshot_every=1, write_interval=999, snapshot_interval=0)
+    w = World(seed=3, population=40)
+    rec.prime(w)                                   # as the ticker does at boot: starts the clock
+    w.step(30)
+    rec.flush(w)                                   # throttled: too soon after prime
+    assert rec.writes == 0 and rec.skipped == 1
+    rec.flush(w, force_snapshot=True)              # forced writes regardless
+    assert rec.writes == 1 and rec.snapshots == 1 and rec.last_error == ""
+    raw = store.read_snapshot("v")
+    from civilisation.security import verify_blob
+    assert gzip.decompress(verify_blob(raw))[:1] == b"\x80"      # a gzipped pickle
+    assert restore_world(store, "v").day == 30
+
+    small = Recorder(store, "v2", snapshot_every=1, write_interval=0, snapshot_interval=0, max_snapshot_mb=0.0001)
+    small.flush(w, force_snapshot=True)
+    assert "not stored" in small.last_error and store.read_snapshot("v2") is None
+
+
+def test_every_event_and_thought_is_stored(tmp_path, monkeypatch):
+    """Nothing the town says or thinks may be lost between the world and the store."""
+    monkeypatch.setenv("APP_SECRET", "t")
+    from civilisation.persistence import SQLiteStore, Recorder
+    store = SQLiteStore(str(tmp_path / "all.db"))
+    rec = Recorder(store, "v", snapshot_every=10**9, write_interval=0)
+    w = World(seed=6, population=60)
+    rec.prime(w, restored=False)          # a brand-new village: record everything, from the founding
+    for _ in range(6):
+        w.step(120)
+        rec.flush(w)
+    assert rec.dropped == 0, rec.last_error
+    assert len(store.read_events("v", limit=10**6)) == w.events_total
+    assert len(store.read_thoughts("v", limit=10**6)) == w.thoughts_total
