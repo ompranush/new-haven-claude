@@ -339,3 +339,20 @@ def test_every_event_and_thought_is_stored(tmp_path, monkeypatch):
     assert rec.dropped == 0, rec.last_error
     assert len(store.read_events("v", limit=10**6)) == w.events_total
     assert len(store.read_thoughts("v", limit=10**6)) == w.thoughts_total
+
+
+def test_prune_never_touches_an_adopted_person():
+    """Someone's own character must keep their diary and ties, alive or dead, forever."""
+    from civilisation.systems.lifecycle import die
+    w = World(seed=13, population=60)
+    w.step(200)
+    mine = w.adopt("Ada Steward", "F", 30, {}, "I came from the coast.", sponsor="om")
+    w.step(400)
+    assert mine.memories
+    die(w, mine, "an accident")
+    w.day += 40 * 365                                   # long enough to be pruned if they were ordinary
+    w.prune()
+    assert mine.id in w.citizens, "an adopted person was deleted"
+    assert w.citizens[mine.id].memories, "an adopted person's diary was wiped"
+    ordinary = [c for c in w.citizens.values() if not c.alive and not c.sponsor]
+    assert ordinary and all(not c.memories for c in ordinary), "ordinary dead should be stripped"

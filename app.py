@@ -163,6 +163,12 @@ def shared_village():
     if w.brain is None:
         from civilisation.brains import RulesBrain
         w.brain = RulesBrain()
+    if state["restored"]:                      # an older snapshot may carry years of unpruned history
+        before = sum(len(c.relationships) for c in w.citizens.values())
+        w.prune()
+        after = sum(len(c.relationships) for c in w.citizens.values())
+        if before != after:
+            state["notes"].append(f"tidied on restore: {before - after:,} stale relationships released")
     rec = Recorder(store, VILLAGE,
                    snapshot_every=int(os.environ.get("SNAPSHOT_EVERY_DAYS", 365)),
                    write_interval=float(os.environ.get("WRITE_INTERVAL_SECONDS", 30)),

@@ -230,7 +230,8 @@ class World:
         and the living forget people they barely knew. The full record lives in the store."""
         keep_dead_days = 30 * 365
         for c in self.citizens.values():
-            if not c.alive and (c.memories or c.relationships):
+            # someone's adopted person keeps their diary and their ties, whatever happens to them
+            if not c.alive and not c.sponsor and (c.memories or c.relationships):
                 c.memories, c.relationships = [], {}      # a name, dates and a family line are enough
         # anyone still pointed at by a family tie, a movement, the chronicle or a diary line must stay,
         # or lookups elsewhere would break
@@ -251,7 +252,8 @@ class World:
         if self.strike:
             referenced.update(self.strike["members"])
         gone = [c.id for c in self.citizens.values()
-                if not c.alive and c.id not in referenced and self.day - (c.died_day or 0) > keep_dead_days]
+                if not c.alive and not c.sponsor and c.id not in referenced
+                and self.day - (c.died_day or 0) > keep_dead_days]
         for cid in gone:
             del self.citizens[cid]
             self.brains.pop(cid, None)
