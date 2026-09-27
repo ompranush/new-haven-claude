@@ -336,7 +336,8 @@ class Recorder:
         if restored:
             self.events_seen = getattr(world, "events_total", len(world.events))
             self.thoughts_seen = getattr(world, "thoughts_total", len(world.thoughts))
-            self.metrics_day = world.history[-1]["day"] if world.history else -1
+            hist = getattr(world, "realm_history", None) or world.history
+            self.metrics_day = hist[-1]["day"] if hist else -1
         else:
             self.events_seen = self.thoughts_seen = 0
             self.metrics_day = -1
@@ -372,7 +373,7 @@ class Recorder:
                                        f"lower WRITE_INTERVAL_SECONDS or TICK_SECONDS")
                 self.store.write_thoughts(self.village, world.thoughts[-min(want, len(world.thoughts)):])
                 self.thoughts_seen = ttotal
-            rows = [r for r in world.history if r["day"] > self.metrics_day]
+            rows = [r for r in (getattr(world, "realm_history", None) or world.history) if r["day"] > self.metrics_day]
             if rows:
                 self.store.write_metrics(self.village, rows)
                 self.metrics_day = rows[-1]["day"]
@@ -428,3 +429,39 @@ def restore_world(store: Store, village: str):
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(("nh:" + token).encode()).hexdigest()
+
+
+def migrate_single_village(store: Store, village: str, old, seed: int = 2026, population: int = 300, era: str = "medieval"):
+    """v0.2 → v0.3: the old single village becomes the five-village realm.
+
+    The old save is kept under `<village>-v02-backup`. Every living adopted person is carried across into the
+    village whose temperament suits them best, keeping their name, story, money, skills, goal and recent
+    memories; their resident row (claim token, stored key) is moved to their new id, so tokens keep working.
+    Returns (world, number carried across)."""
+    from .world import World
+    from .realm import ELEMENTS
+    from .security import verify_blob
+    try:
+        blob = store.read_snapshot(village)
+        if blob:
+            store.write_snapshot(f"{village}-v02-backup", getattr(old, "day", 0), verify_blob(blob))
+    except Exception:
+        pass
+    w = World(seed=seed, population=population, name="New Haven", config={"era": era})
+    moved = 0
+    rows = {int(r["citizen_id"]): r for r in store.read_residents(village)}
+    for oc in list(old.citizens.values()):
+        if not getattr(oc, "sponsor", "") or not oc.alive:
+            continue
+        p = dict(oc.personality)
+        # the village whose temper leans the way they do
+        best = max(w.villages, key=lambda v: sum(d * (p.get(k, 0.5) - 0.5) for k, d in ELEMENTS[v.element]["temper"].items()))
+        age = max(18, (old.day - oc.born_day) // 365)
+        c = w.adopt(oc.name, oc.sex, age, p, backstory=getattr(oc, "backstory", ""), sponsor=oc.sponsor, money=float(oc.money), village=best.idx)
+        c.skill, c.education, c.goal, c.happiness = oc.skill, oc.education, oc.goal, oc.happiness
+        c.memories = list(oc.memories[-30:])
+        c.remember(w.day, f"The old town is gone. I've made a new start in {best.name}, the {best.element} village.", "hope", 0.9, tag="life")
+        if oc.id in rows:
+            store.transfer_resident(village, oc.id, c.id, c.name)
+        moved += 1
+    return w, moved

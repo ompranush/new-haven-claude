@@ -27,6 +27,9 @@ from civilisation.providers import PROVIDERS, make_backend
 from civilisation.persistence import get_store, Recorder, restore_world, encrypt_key, decrypt_key, token_hash
 from civilisation.person import apply_person_plan, interpret_person, rules_interpret_person, PERSON_OPS
 from civilisation.security import esc, clean_text, scrub, Limiter, allow_custom_providers
+from civilisation.realm import ELEMENTS
+from civilisation.systems import animals as animal_sys
+from civilisation import behaviour
 
 
 @st.cache_resource(show_spinner=False)
@@ -115,7 +118,7 @@ def new_world(seed, pop, llm, era="medieval"):
             brain = make_brain()
         except Exception as e:
             st.toast(f"LLM brain unavailable: {e}", icon="⚠️")
-    return World(seed=seed, population=pop, width=52, height=34, brain=brain, config={"era": era})
+    return World(seed=seed, population=pop, brain=brain, config={"era": era})
 
 
 @st.cache_resource(show_spinner="Joining the public village…")
@@ -131,11 +134,24 @@ def shared_village():
         w = restore_world(store, VILLAGE)
     except Exception as e:
         state["notes"].append(f"could not restore snapshot: {e}")
+    if w is not None and not hasattr(w, "villages"):
+        # a save from before the five villages: carry every adopted person across, keep their tokens
+        from civilisation.persistence import migrate_single_village
+        try:
+            w, moved = migrate_single_village(store, VILLAGE, w, seed=int(os.environ.get("VILLAGE_SEED", 2026)),
+                                              population=int(os.environ.get("VILLAGE_POP", 300)), era=os.environ.get("VILLAGE_ERA", "medieval"))
+            state["notes"].append(f"migrated to the five villages: {moved} adopted people carried across")
+            state["migrated"] = True
+        except Exception as e:
+            state["notes"].append(f"migration failed, starting fresh: {e}")
+            w = None
     if w is None:
-        w = World(seed=int(os.environ.get("VILLAGE_SEED", 2026)), population=int(os.environ.get("VILLAGE_POP", 120)), width=52, height=34, name="New Haven Commons",
-              config={"era": os.environ.get("VILLAGE_ERA", "medieval")})
+        w = World(seed=int(os.environ.get("VILLAGE_SEED", 2026)), population=int(os.environ.get("VILLAGE_POP", 300)), name="New Haven",
+              config={"era": os.environ.get("VILLAGE_ERA", "medieval"),
+                      "max_population": int(os.environ.get("MAX_POPULATION", 600)),        # per village
+                      "max_relationships": int(os.environ.get("MAX_RELATIONSHIPS", 150))})
     else:
-        state["restored"] = True
+        state["restored"] = not state.get("migrated")
     state["world"] = w
     try:                                                 # host brain from the first provider key in the environment
         for prov, (_, model, env, _) in PROVIDERS.items():
@@ -149,6 +165,8 @@ def shared_village():
         for r in store.read_residents(VILLAGE):
             cid = int(r["citizen_id"])
             state["residents"][cid] = r.get("sponsor") or "anonymous"
+            if cid in w.animals:
+                continue
             if cid in w.citizens and not w.citizens[cid].sponsor:
                 w.citizens[cid].sponsor = r.get("sponsor") or "anonymous"   # backfill people who moved in before this was required
             key = decrypt_key(r.get("enc_key"))
@@ -220,7 +238,7 @@ if PUBLIC and st.query_params.get("claim") and not ss.get("resident_id"):
         limiters()["claim"].hit(ss.sid)
         th = token_hash(tok)
         for r in shared["store"].read_residents(VILLAGE):
-            if r.get("token_hash") == th and int(r["citizen_id"]) in w.citizens:
+            if r.get("token_hash") == th and (int(r["citizen_id"]) in w.citizens or int(r["citizen_id"]) in w.animals):
                 ss.resident_id = int(r["citizen_id"]); ss.steward_token = tok; ss.selected = ss.resident_id
                 ss.welcomed = True
                 ss.nav = "🏡 Move in"
@@ -236,7 +254,7 @@ def claim_person(token: str) -> bool:
     limiters()["claim"].hit(ss.sid)
     th = token_hash(clean_text(token, 100))
     hit = next((r for r in shared["store"].read_residents(VILLAGE) if r.get("token_hash") == th), None)
-    if hit and int(hit["citizen_id"]) in w.citizens:
+    if hit and (int(hit["citizen_id"]) in w.citizens or int(hit["citizen_id"]) in w.animals):
         ss.resident_id = int(hit["citizen_id"])
         ss.steward_token = token.strip()
         ss.selected = ss.resident_id
@@ -294,21 +312,23 @@ WELCOME_CSS = """<style>
 
 
 def welcome_screen():
-    alive_now = w.alive()
-    sponsored_all = [c for c in w.citizens.values() if c.sponsor]
+    alive_now = w.alive_all()
+    sponsored_all = [c for c in w.citizens.values() if c.sponsor] + [a for a in w.animals.values() if a.sponsor]
     residents = [c for c in sponsored_all if c.alive]
-    movements = [m for m in w.movements.values() if m.alive]
+    wars_now = [x for x in w.wars if x.get("active")]
     st.markdown(FONTS + WELCOME_CSS, unsafe_allow_html=True)
 
-    stats = [(f"{len(alive_now):,}", "people"), (f"{len(w.open_businesses()):,}", "businesses"),
-             (f"{len(movements):,}", "movements"), (f"{w.day // 365:,}", "years old") if w.day >= 730 else (f"{w.day:,}", "days old")]
+    stats = [(f"{len(alive_now):,}", "people"), ("5", "villages"), (f"{sum(a.alive for a in w.animals.values()):,}", "animals"),
+             (f"{len(wars_now)}", "wars now" if len(wars_now) != 1 else "war now"),
+             (f"{w.day // 365:,}", "years old") if w.day >= 730 else (f"{w.day:,}", "days old")]
     if sponsored_all:
         stats.append((f"{len(residents):,}", "adopted"))
     overlay = FONTS + HERO_CSS + f"""<div id="hero">
       <div class="live"><i class="dot"></i>Live now · {esc(display_year(w))} · day {w.day:,}</div>
-      <h1>{esc(w.name)}</h1>
-      <div class="lede">A village that has been running since its founding and never stops. Its people work, fall out, marry,
-        form parties and go hungry entirely on their own. Nobody writes the story in advance.</div>
+      <h1>{esc(w.realm_name)}</h1>
+      <div class="lede">Five villages — Sky, Air, Earth, Fire and Water — on one river that is never quite enough. Their people work,
+        love, steal, riot and go to war entirely on their own, and somewhere in each village a secret circle keeps the old power.
+        Nobody writes the story in advance.</div>
       <div class="stats">{"".join(f'<div class="s"><b>{v}</b><span>{k}</span></div>' for v, k in stats)}</div>
     </div>"""
     if "hero_html" not in ss:              # built once per session: the iframe must not re-mount on every rerun
@@ -318,7 +338,7 @@ def welcome_screen():
     cards = [("watch", "👁", "#1e3a8a", "Watch the village",
               "Follow the town as it lives: the map, its people, the economy, politics and the chronicle. Nothing to sign up for."),
              ("move", "🏡", "#14532d", "Move someone in",
-              "Invent a person with a name, a temperament and a past. Let them live by the rules, or give them your own model as a mind."),
+              "A person or an animal, into any of the five villages. Give them a temperament and a past — and, if you like, your own model as a mind."),
              ("claim", "🔑", "#713f12", "Return to your person",
               "Already have someone living here? Paste the claim token you were given when they moved in.")]
     cols = st.columns(3, gap="medium")
@@ -341,10 +361,11 @@ def welcome_screen():
                     if st.form_submit_button("Claim", use_container_width=True) and claim_person(tok):
                         st.rerun()
 
-    notable = [e for e in w.events if e.importance >= 0.55][-4:][::-1]
+    notable = [e for e in w.events if e.importance >= 0.55 and not e.secret][-4:][::-1]
     if notable:
         st.markdown('<div class="nh-kicker">Lately in the village</div><div class="nh-feed">'
-                    + "".join(f"<div><b>Day {e.day:,}</b>{esc(e.text)}</div>" for e in notable) + "</div>", unsafe_allow_html=True)
+                    + "".join(f"<div><b>Day {e.day:,}{' · ' + esc(w.villages[e.village].name) if e.village >= 0 else ''}</b>{esc(e.text)}</div>" for e in notable)
+                    + "</div>", unsafe_allow_html=True)
 
     with st.container(key="private_strip"):
         d, e = st.columns([3, 1], vertical_alignment="center")
@@ -356,11 +377,19 @@ def welcome_screen():
             ss.playing = False
             ss.pop("iso_html", None)
             st.rerun()
-    st.markdown('<div class="nh-foot">New Haven · an agent-based civilisation · no script, no ending</div>', unsafe_allow_html=True)
+    st.markdown('<div class="nh-foot">New Haven · five villages, one river · no script, no ending</div>', unsafe_allow_html=True)
 
 
 w.lock.acquire()          # the public village ticks on another thread; hold it still while we draw
 try:
+  # which of the five villages this visitor is looking at (their own person's, at first)
+  if ss.get("pending_village") is not None:          # set before the picker is drawn (widgets can't be changed after)
+      ss.village = ss.pop("pending_village")
+  if ss.get("village") is None or not (0 <= int(ss.get("village")) < len(w.villages)):
+      rid0 = ss.get("resident_id")
+      ss.village = w.citizens[rid0].village if rid0 in w.citizens else (w.animals[rid0].village if rid0 in w.animals else 0)
+  w.focus = int(ss.village)
+  VILLAGE_NOW = w.villages[w.focus]
   if PUBLIC and not ss.get("welcomed"):
       welcome_screen()
       st.stop()
@@ -385,6 +414,56 @@ try:
 
   def bar(label, v, colour):
       return f'<div style="display:flex;justify-content:space-between;font-size:12px;color:#8b98a8"><span>{label}</span><span>{v*100:.0f}%</span></div><div class="bar"><div style="width:{v*100:.0f}%;background:{colour}"></div></div>'
+
+
+  def realm_full():
+      """MAX_RESIDENTS caps everyone visitors have moved in — people and animals, across the five villages."""
+      moved_in = sum(1 for c in w.citizens.values() if c.sponsor and c.alive) + sum(1 for x in w.animals.values() if x.sponsor and x.alive)
+      return PUBLIC and moved_in >= int(os.environ.get("MAX_RESIDENTS", 60))
+
+  def animal_steward(a):
+      sp = animal_sys.SPECIES[a.species]
+      st.markdown(f"#### You look after {sp['emoji']} {esc(a.name)}")
+      if ss.get("steward_token"):
+          st.info(f"Your claim token — keep it:\n\n`{ss.steward_token}`")
+      owner = w.citizens.get(a.owner_id) if a.owner_id else None
+      st.markdown(f"<div style='font-size:13px;color:#c9d3df'>{a.species}, {a.age_on(w.day)} years · {'wild' if a.wild else 'tame'} · "
+                  f"{esc(w.villages[a.village].name)} · {esc(a.doing)}" + (f" · follows {esc(owner.name)}" if owner else "") +
+                  f" · health {a.health*100:.0f}% · hunger {a.hunger*100:.0f}%" + (f" · {a.kills} kills" if a.kills else "") + "</div>", unsafe_allow_html=True)
+      if not a.alive:
+          st.error(f"{a.name} died on day {a.died_day:,} ({a.cause_of_death}).")
+          if st.button("Let them go (bring someone new)"):
+              ss.resident_id = None; ss.steward_token = None; st.rerun()
+          return
+      with st.form("animal_instr", clear_on_submit=True, border=False):
+          instr = st.text_input("Tell them", placeholder=f"Follow Ivy Walker · Go for the tax collector · Run free in the hills · Cross into Galehaven · Hunt",
+                                label_visibility="collapsed")
+          if st.form_submit_button("Call to them", type="primary", use_container_width=True) and instr.strip():
+              done = animal_sys.instruct(w, a, clean_text(instr, 300))
+              st.toast(" · ".join(done), icon="🐾")
+
+  EMO_COL = {"anger": "#ef4444", "fear": "#a78bfa", "grief": "#60a5fa", "joy": "#facc15", "shame": "#f472b6", "pride": "#fb923c",
+             "envy": "#22c55e", "hope": "#2dd4bf", "love": "#fb7185"}
+  DICE = "⚀⚁⚂⚃⚄⚅"
+
+  def feelings_html(c):
+      """What they feel, how strongly — the level decides what they'll do."""
+      em = sorted(c.emotions.items(), key=lambda kv: -kv[1])[:3]
+      if not em:
+          return '<div style="font-size:12px;color:#8b98a8;margin-top:6px">Feeling: calm</div>'
+      return '<div style="font-size:13px;color:#8b98a8;margin-top:6px">Feeling</div>' + "".join(
+          f'<div style="display:flex;justify-content:space-between;font-size:12px;color:#c9d3df"><span>{e} · <i>{behaviour.band_name(l)}</i></span><span>{l*100:.0f}</span></div>'
+          f'<div class="bar"><div style="width:{l*100:.0f}%;background:{EMO_COL.get(e, "#8b98a8")}"></div></div>' for e, l in em)
+
+  def last_roll_html(c):
+      """The six things they considered last time something happened to them, and where the die landed."""
+      t = next((t for t in reversed(w.thoughts) if t.get("cid") == c.id and t.get("options")), None)
+      if not t:
+          return ""
+      rows = "".join(f'<div style="font-size:11.5px;display:flex;justify-content:space-between;padding:1px 0;{"color:#fff;font-weight:700" if i + 1 == t["face"] else "color:#8b98a8"}">'
+                     f'<span>{DICE[i]} {k.replace("_", " ")}</span><span>{p*100:.0f}%</span></div>' for i, (k, p) in enumerate(t["options"][:6]))
+      return (f'<div style="font-size:13px;color:#8b98a8;margin-top:8px">Last decision · day {t["day"]}</div>'
+              f'<div style="background:#101826;border:1px solid #1f2a3a;border-radius:8px;padding:6px 8px;margin-top:3px">{rows}</div>')
 
 
   # ------------------------------------------------------------------ header
@@ -466,10 +545,28 @@ try:
       PAGES = ["🌍 World", "👥 Citizens", "📊 Economy", "🏛️ Politics", "⚡ Events", "🏡 Move in", "🧪 Research", "⚙️ Settings"]
       page = st.segmented_control("nav", PAGES, default=PAGES[0], key="nav", label_visibility="collapsed") or PAGES[0]
 
+  def village_label(i):
+      v = w.villages[i]
+      at_war = any(x.get("active") and i in (x["a"], x["b"]) for x in w.wars)
+      flags = (" ⚔️" if at_war else "") + (" ⛓️" if v.occupier is not None else "") + (" ☠️" if v.fallen else "")
+      return f"{ELEMENTS[v.element]['emblem']} {v.name}{flags}"
+  vcol, vinfo = st.columns([3.2, 2.3])
+  with vcol:
+      st.segmented_control("village", list(range(len(w.villages))), format_func=village_label, key="village", label_visibility="collapsed")
+  with vinfo:
+      V = VILLAGE_NOW
+      war_line = "; ".join(f"at war with {w.villages[x['b'] if x['a'] == V.idx else x['a']].name}" for x in w.wars if x.get("active") and V.idx in (x["a"], x["b"]))
+      st.markdown(f'<div style="font-size:12px;color:#c9d3df;line-height:1.35;padding-top:2px"><b style="color:{V.colour}">{esc(V.name)}</b> · the {V.element} village · '
+                  f'river {V.water_met*100:.0f}% of need · takes {V.diversion*100:.0f}% of the flow'
+                  + (f' · <span style="color:#f87171">{esc(war_line)}</span>' if war_line else "")
+                  + (f' · <span style="color:#eda100">occupied by {esc(w.villages[V.occupier].name)}</span>' if V.occupier is not None else "")
+                  + (' · <span style="color:#f87171">in ruins</span>' if V.fallen else "") + "</div>", unsafe_allow_html=True)
+
   # ------------------------------------------------------------------ WORLD
   def world_page():
       global alive, last, prev
       with w.lock:
+          w.focus = int(ss.get("village") or 0)
           if not PUBLIC and ss.playing:
               w.step(SPEEDS.get(ss.speed, (1, 1.0))[0])
           alive = w.alive()
@@ -494,12 +591,28 @@ try:
                       stat("💗", "Life expectancy", f"{life_exp:.1f}") +
                       stat("📉", "Unemployment", f"{last['unemployment']:.1f}%", delta("unemployment", "{:+.1f}", invert=True, pct=True)) +
                       stat("🌾", "Food supply", f"{food_days:.0f} days", delta("food", "{:+.0f}")) +
+                      stat("💧", "River share", f"{VILLAGE_NOW.water_met*100:.0f}% of need") +
+                      stat("🚨", "Crimes this year", f"{VILLAGE_NOW.crimes_year} ({VILLAGE_NOW.arrests_year} arrests)") +
+                      stat("⚔️", "Guards · watch", f"{last.get('soldiers', 0)} · {last.get('police', 0)}") +
                       stat("🛡️", "Security", f"{security:.0f}%") + "</div>", unsafe_allow_html=True)
+          rows_r = ""
+          for v in w.villages:
+              pop_v = sum(1 for c in w.citizens.values() if c.alive and c.village == v.idx)
+              state_v = "ruins" if v.fallen else (f"held by {w.villages[v.occupier].name}" if v.occupier is not None else
+                        ("at war" if any(x.get("active") and v.idx in (x["a"], x["b"]) for x in w.wars) else "at peace"))
+              col_v = "#f87171" if state_v in ("ruins", "at war") or v.occupier is not None else "#8b98a8"
+              rows_r += (f'<div class="stat"><div class="ic" style="background:{v.colour}33;color:{v.colour}">{ELEMENTS[v.element]["emblem"]}</div>'
+                         f'<div><div class="lb">{esc(v.name)} · <span style="color:{col_v}">{state_v}</span></div><div class="vl" style="font-size:14px">{pop_v} people · '
+                         f'💧{v.water_met*100:.0f}%</div></div></div>')
+          st.markdown(f'<div class="panel"><h4>The Realm</h4>{rows_r}<div style="font-size:11px;color:#8b98a8;margin-top:4px">The river flows Sky → Air → Earth → Fire → Water.</div></div>',
+                      unsafe_allow_html=True)
           # minimap
-          cols = {terrain.WATER: "#3b82c4", terrain.GRASS: "#6fa857", terrain.FARMLAND: "#c9a85a", terrain.FOREST: "#3f7d4e", terrain.ROCK: "#8f8f8a", terrain.TOWN: "#cfc2a8", terrain.ROAD: "#b8a888"}
+          cols = {terrain.WATER: "#3b82c4", terrain.GRASS: "#6fa857", terrain.FARMLAND: "#c9a85a", terrain.FOREST: "#3f7d4e", terrain.ROCK: "#8f8f8a",
+                  terrain.TOWN: "#cfc2a8", terrain.ROAD: "#b8a888", terrain.SAND: "#e2cf98", terrain.SNOW: "#eef3f7", terrain.ASH: "#4a3f3a",
+                  terrain.LAVA: "#ff5a1f", terrain.DAM: "#6b5a44", terrain.RUIN: "#2b2b2b"}
           fig = go.Figure()
           cs = []
-          n = 7
+          n = 13
           for k, c in cols.items():
               cs += [[k / n, c], [(k + 1) / n, c]]
           fig.add_trace(go.Heatmap(z=w.grid, colorscale=cs, zmin=0, zmax=n, showscale=False, hoverinfo="skip"))
@@ -507,8 +620,13 @@ try:
           fig.add_trace(go.Scatter(x=[b.x for b in bs], y=[b.y for b in bs], mode="markers", marker=dict(size=6, color="#ffd43b", symbol="square"), hoverinfo="skip"))
           homes = list({c.home for c in alive})
           fig.add_trace(go.Scatter(x=[h[0] for h in homes], y=[h[1] for h in homes], mode="markers", marker=dict(size=3, color="#f97316", symbol="square"), hoverinfo="skip"))
+          x0_, y0_, x1_, y1_ = VILLAGE_NOW.region
+          fig.add_shape(type="rect", x0=x0_ - 0.5, y0=y0_ - 0.5, x1=x1_ - 0.5, y1=y1_ - 0.5, line=dict(color=VILLAGE_NOW.colour, width=2))
+          for x in w.wars:
+              if x.get("active"):
+                  fig.add_trace(go.Scatter(x=[x["front"][0]], y=[x["front"][1]], mode="text", text=["⚔️"], hoverinfo="skip"))
           fig.update_layout(height=170, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)", showlegend=False,
-                            xaxis=dict(visible=False), yaxis=dict(visible=False, scaleanchor="x"))
+                            xaxis=dict(visible=False), yaxis=dict(visible=False, scaleanchor="x", autorange="reversed"))
           with st.container(border=True):
               st.markdown("<h4>Map</h4>", unsafe_allow_html=True)
               st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -519,8 +637,16 @@ try:
           if "iso_html" not in ss:
               render = render_iso if ss.get("renderer") == "classic" else render_3d
               ss.iso_html = render(w, ss.selected, height=600, url=f"/app/static/world_{ss.sid}.json")
-          write_snapshot(w, snap, ss.selected)
+          fronts = [x for x in w.wars if x.get("active") and w.focus in (x["a"], x["b"])]
+          write_snapshot(w, snap, ss.selected, follow=bool(ss.get("follow")), look=ss.get("look"))
           components.html(ss.iso_html, height=604)
+          cam1, cam2, cam3 = st.columns(3)
+          if fronts and cam1.button("⚔️ Go to the front", use_container_width=True):
+              ss.look = tuple(fronts[0]["front"]); ss.follow = False; st.rerun()
+          if VILLAGE_NOW.dam and cam2.button("💧 Look at the dam", use_container_width=True):
+              ss.look = tuple(VILLAGE_NOW.dam); ss.follow = False; st.rerun()
+          if ss.get("look") and cam3.button("🏘️ Back to the village", use_container_width=True):
+              ss.look = None; st.rerun()
           if w.pandemic:
               st.error(f"🦠 {w.pandemic['name']} is spreading — {last['infected']} sick, {w.pandemic['deaths']} dead.")
           if w.strike:
@@ -531,14 +657,15 @@ try:
               st.warning(f"📉 Recession — {w.recession_days} days to go.")
 
       with right:
-          options = {c.id: f"{c.name} ({c.age_on(w.day)})" for c in sorted(alive, key=lambda c: c.id)}
+          options = {c.id: f"{c.name} ({c.age_on(w.day)}{', ' + c.role if c.role else ''})" for c in sorted(alive, key=lambda c: c.id)}
           if not options:
               options = {c.id: f"{c.name} († day {c.died_day})" for c in list(w.citizens.values())[:50]}
           if ss.selected not in options:
               ss.selected = max(alive, key=lambda c: len(c.memories)).id if alive else next(iter(options))
           ss.selected = st.selectbox("Selected citizen", list(options), index=list(options).index(ss.selected) if ss.selected in options else 0,
                                      format_func=lambda i: options[i], label_visibility="collapsed")
-          write_snapshot(w, os.path.join(STATIC, f"world_{ss.sid}.json"), ss.selected)
+          ss.follow = st.toggle("🎥 Camera follows them", value=bool(ss.get("follow", False)))
+          write_snapshot(w, os.path.join(STATIC, f"world_{ss.sid}.json"), ss.selected, follow=bool(ss.get("follow")), look=ss.get("look"))
           c = w.citizens[ss.selected]
           emp = w.businesses.get(c.employer_id) if c.employer_id else None
           mood = "😊 Happy" if c.happiness > 0.65 else ("😐 Fine" if c.happiness > 0.45 else "😟 Struggling")
@@ -553,6 +680,11 @@ try:
                       f'<span style="color:#eda100">{", ".join(describe(c)).capitalize()}</span><br>Age: {c.age_on(w.day)} · {job_label(w, c.job).title()}{" at " + esc(emp.name) if emp else ""}<br>Mood: {mood}<br>Location: {esc(where)}</div></div>'
                       f'<div style="margin:10px 0 6px 0;padding:8px 10px;border-left:3px solid #eda100;background:#1b2636;border-radius:6px;font-size:13px;color:#e6edf3;font-style:italic">“{esc(thought(w, c))}”</div>'
                       + bar("Health", c.health, "#4ade80") + bar("Happiness", c.happiness, "#3b82f6") + bar("Energy", 1 - c.hunger, "#eda100") + bar("Social", social, "#8b5cf6")
+                      + feelings_html(c) + (f'<div style="font-size:12px;color:#c9d3df;margin-top:4px">🏛️ {c.role.title()} of {esc(VILLAGE_NOW.name)}</div>' if c.role else "")
+                      + (f'<div style="font-size:12px;color:#8b5cf6;margin-top:4px">✦ {c.magic["element"]} mage · power {c.magic["power"]*100:.0f}%'
+                         + ('' if c.magic.get("revealed") else ' · <i>secret</i>') + '</div>' if c.magic and c.magic.get("awakened") and (IS_GOD or c.magic.get("revealed")) else "")
+                      + (f'<div style="font-size:12px;color:#f87171;margin-top:4px">⛓️ In the cells until day {c.jailed_until:,}</div>' if c.jailed_until >= w.day else "")
+                      + last_roll_html(c)
                       + f'<div style="font-size:13px;color:#8b98a8;margin-top:6px">Current goal</div><div style="font-size:14px;color:#fff">🎯 {c.goal.capitalize()} <span style="color:#8b98a8">({c.goal_progress*100:.0f}%)</span></div>'
                       + '<div style="font-size:13px;color:#8b98a8;margin-top:8px">Recent memories</div>'
                       + "".join(f'<div class="mem"><b>Day {m.day}</b>{esc(m.text)}</div>' for m in mems) + (f'<div class="mem" style="color:#8b98a8">Nothing memorable yet.</div>' if not mems else "")
@@ -566,13 +698,29 @@ try:
                   ss.speed = st.select_slider("Speed while playing", options=list(SPEEDS), value=ss.speed if ss.speed in SPEEDS else "1 day / sec")
               INJECTABLE = all_injectable(w)
               shock = st.selectbox("God mode", list(INJECTABLE), format_func=lambda k: f"⚡ {k.replace('_', ' ')} — {INJECTABLE[k]}", label_visibility="collapsed", disabled=not IS_GOD)
-              if st.button("Smite the town", use_container_width=True, type="primary", disabled=not IS_GOD):
+              if st.button(f"Smite {VILLAGE_NOW.name}", use_container_width=True, type="primary", disabled=not IS_GOD):
                   w.inject(shock); st.toast(INJECTABLE[shock], icon="⚡"); st.rerun()
+              sp1, sp2 = st.columns([2, 1])
+              wonder = sp1.selectbox("Wonder", ["meteor_shower", "wildfire", "earthquake", "lightning_storm", "tornado", "flood", "aurora", "eclipse"],
+                                     format_func=lambda k: "☄️ " + k.replace("_", " "), label_visibility="collapsed", disabled=not IS_GOD)
+              w_where = sp2.selectbox("On", [w.focus] + [v.idx for v in w.villages if v.idx != w.focus] + [-1],
+                                      format_func=lambda i: "every village" if i == -1 else w.villages[i].name, label_visibility="collapsed", disabled=not IS_GOD)
+              if st.button(f"Unleash on {'every village' if w_where == -1 else w.villages[w_where].name}", use_container_width=True, disabled=not IS_GOD):
+                  from civilisation.commands import spectacle
+                  done_w = []
+                  for idx in ([v.idx for v in w.villages if not v.fallen] if w_where == -1 else [w_where]):
+                      with w.at(idx):
+                          spectacle(w, wonder, 0.7, done_w, set())
+                  if w_where not in (-1, w.focus):
+                      ss.pending_village = w_where; ss.look = None          # go and see where it fell
+                  st.toast(" ".join(done_w), icon="☄️"); st.rerun()
               has_key = host_cfg()["has_key"]
-              st.markdown('<div style="font-size:13px;color:#8b98a8;margin-top:6px">✍️ Or decree anything' + ("" if has_key else " <span style='color:#eda100'>(needs an API key — Settings)</span>") + "</div>", unsafe_allow_html=True)
+              st.markdown('<div style="font-size:13px;color:#8b98a8;margin-top:6px">✍️ Or decree anything — it happens, whatever it is' + ("" if has_key else " <span style='color:#8b98a8'>(keyword reading; add an API key in Settings for anything you can type)</span>") + "</div>", unsafe_allow_html=True)
               with st.form("decree_form", clear_on_submit=True, border=False):
-                  decree = st.text_area("Decree", placeholder="e.g. A travelling circus arrives · Gold is found in the hills · A preacher declares the council cursed · The bakery owner is caught cheating customers · Bread is free for a month",
+                  decree = st.text_area("Decree", placeholder="e.g. War between Fire and Water · A meteor shower falls on Emberhold · Ivy Walker must kill Elif Patel · Give Omar the power of fire · Wolves come down from the hills · Break Skyreach's dam",
                                         label_visibility="collapsed", height=80)
+                  d_where = st.selectbox("Where", ["the village it names (or " + VILLAGE_NOW.name + ")", "every village"] + [v.name for v in w.villages],
+                                         label_visibility="collapsed")
                   submitted = st.form_submit_button("Make it so ✨", use_container_width=True, disabled=not IS_GOD)
               decree = clean_text(decree, 1500)
               if submitted and decree.strip() and IS_GOD:
@@ -583,14 +731,22 @@ try:
                           from civilisation.llm import interpret
                           with st.spinner("Fate is deciding…"):
                               plan = interpret(w, decree.strip(), backend=host_backend())
+                          if not [e for e in plan.get("effects", []) if e.get("op") != "memory"]:
+                              plan = None                  # a model that declined or did nothing: the decree still happens
                       except Exception as e:
-                          st.error(f"The model could not interpret that: {e}")
-                  if plan is None and not has_key:
-                      plan, source = fallback_plan(decree), "rules"
-                      if plan is None:
-                          st.warning("Without an API key only a couple of stock phrases work (try 'circus' or 'gold'). Add a key in Settings for anything you can type.")
+                          st.toast(f"The model didn't answer ({scrub(e)}); reading the decree by keywords.", icon="⚠️")
+                  if plan is None:
+                      plan, source = fallback_plan(decree, w), "rules"
                   if plan:
+                      if d_where == "every village":
+                          plan["village"] = "all"
+                      elif not d_where.startswith("the village it names"):
+                          plan["village"] = next(v.element for v in w.villages if v.name == d_where)
                       done = apply_plan(w, plan, source)
+                      from civilisation.commands import village_index
+                      hit = village_index(w, plan.get("village")) if plan.get("village") not in (None, "", "all") else []
+                      if len(hit) == 1 and hit[0] != w.focus:
+                          ss.pending_village = hit[0]; ss.look = None       # go and see where it happened
                       ss.decrees = (ss.get("decrees") or []) + [{"day": w.day, "text": decree.strip(), "narration": plan["narration"], "done": done}]
                       if PUBLIC:
                           try:
@@ -622,14 +778,17 @@ try:
       bl, bm, br = st.columns([1, 1, 1.1])
       with bm:
           rows = ""
-          for t in w.thoughts[-9:][::-1]:
+          for t in [t for t in w.thoughts if t.get("village", w.focus) == w.focus][-9:][::-1]:
               spark = "✨ " if t["source"] == "llm" else ""
-              rows += f'<div class="ev"><b>Day {t["day"]}</b><span style="color:#eda100">{spark}{esc(t["name"])}</span>: <i>{esc(t["text"])}</i></div>'
+              die = f'<span title="rolled {t["face"]} of 6" style="color:#8b98a8">{DICE[t["face"] - 1]} </span>' if t.get("face") else ""
+              rows += f'<div class="ev"><b>Day {t["day"]}</b>{die}<span style="color:#eda100">{spark}{esc(t["name"])}</span>: <i>{esc(t["text"])}</i></div>'
           title = "Inner voices" + (" <span style='font-size:11px;color:#4ade80'>✨ = written by Claude</span>" if w.brain.name == "llm" else "")
           st.markdown(f'<div class="panel"><h4>{title}</h4>{rows or "<div class=ev>Nothing on anyone\'s mind yet.</div>"}</div>', unsafe_allow_html=True)
       with bl:
           icons = {"disaster": "🌪️", "politics": "🗳️", "economy": "💰", "life": "🌱", "society": "💍", "social": "💬", "work": "🔧", "discovery": "💡", "founding": "🏛️", "year": "📅", "collapse": "💀", "decree": "✨", "environment": "🌦️"}
-          rows = "".join(f'<div class="ev{" big" if e.importance >= 0.55 else ""}"><b>Day {e.day}</b>{esc(e.text)} {icons.get(e.category, "")}</div>' for e in [e for e in w.events if e.importance >= 0.4][-12:][::-1])
+          icons.update({"crime": "🚨", "justice": "⚖️", "war": "⚔️", "diplomacy": "🕊️", "river": "💧", "magic": "✦", "animals": "🐾"})
+          seen_ev = [e for e in w.events if e.importance >= 0.4 and e.village in (w.focus, -1) and (IS_GOD or not e.secret)]
+          rows = "".join(f'<div class="ev{" big" if e.importance >= 0.55 else ""}"><b>Day {e.day}</b>{"🔒 " if e.secret else ""}{esc(e.text)} {icons.get(e.category, "")}</div>' for e in seen_ev[-12:][::-1])
           st.markdown(f'<div class="panel"><h4>Recent Events</h4>{rows}</div>', unsafe_allow_html=True)
       with br:
           with st.container(border=True):
@@ -654,9 +813,19 @@ try:
       df = w.citizens_df()
       c1, c2 = st.columns([1.4, 1])
       with c1:
+          everywhere = st.toggle("Whole realm", value=False, key="cit_all")
+          if not everywhere and len(df):
+              df = df[df.village == VILLAGE_NOW.name]
           st.dataframe(df.drop(columns=["x", "y"]).sort_values("id"), use_container_width=True, height=560, hide_index=True)
+          fauna = [a for a in w.animals.values() if a.alive and (everywhere or a.village == w.focus)]
+          if fauna:
+              st.markdown("#### Animals")
+              st.dataframe(pd.DataFrame([{"name": a.name, "species": f"{animal_sys.SPECIES[a.species]['emoji']} {a.species}", "village": w.villages[a.village].name,
+                                          "age": a.age_on(w.day), "wild": a.wild, "owner": w.citizens[a.owner_id].name if a.owner_id in w.citizens else "",
+                                          "doing": a.doing, "kills": a.kills, "sponsor": a.sponsor} for a in fauna]), hide_index=True, use_container_width=True, height=260)
       with c2:
-          opts = {f"{c.name} (#{c.id}, {c.age_on(w.day)}{'' if c.alive else ', dead'})": c.id for c in sorted(w.citizens.values(), key=lambda c: (not c.alive, c.id))}
+          opts = {f"{c.name} (#{c.id}, {c.age_on(w.day)}{'' if c.alive else ', dead'})": c.id for c in sorted(w.citizens.values(), key=lambda c: (not c.alive, c.id))
+                  if everywhere or c.village == w.focus}
           pick = st.selectbox("Full biography", list(opts))
           st.markdown(w.biography(opts[pick]))
 
@@ -667,7 +836,7 @@ try:
           st.markdown("#### Businesses")
           st.dataframe(pd.DataFrame([{"name": b.name, "kind": b.kind, "owner": w.citizens[b.owner_id].name if b.owner_id else "—", "staff": len(b.employees),
                                       "wage": round(b.wage), "cash": round(b.cash), "revenue/day": round(float(np.mean(b.revenue_history[-30:])) if b.revenue_history else 0),
-                                      "founded": b.founded_day, "open": b.alive} for b in w.businesses.values()]).sort_values(["open", "cash"], ascending=False),
+                                      "founded": b.founded_day, "open": b.alive} for b in w.businesses.values() if b.village == w.focus]).sort_values(["open", "cash"], ascending=False),
                        hide_index=True, use_container_width=True, height=380)
           money = np.array([c.money for c in alive])
           if len(money):
@@ -694,7 +863,7 @@ try:
           st.markdown("#### Political landscape")
           adults = w.adults()
           if adults:
-              movs = {m.id: m for m in w.movements.values() if m.alive}
+              movs = {m.id: m for m in w.movements_here() if m.alive}
               fig = go.Figure()
               groups = {"Unaffiliated": [c for c in adults if not c.movement_id]}
               for m in movs.values():
@@ -713,10 +882,26 @@ try:
           pol = w.policy
           st.markdown(f"**{pol.ruling_party}** — tax {pol.tax_rate*100:.0f}% · welfare £{pol.welfare:.0f}/day · pension £{pol.pension:.0f}/day · min wage £{pol.min_wage:.0f} · "
                       f"{'public' if pol.public_education else 'private'} schools · {'public' if pol.public_health else 'private'} clinic · next election day {w.next_election_day:,}")
-          if w.movements:
+          if w.movements_here():
               st.dataframe(pd.DataFrame([{"name": m.name, "founder": w.citizens[m.founder_id].name, "founded": m.founded_day, "against": m.grievance_theme,
                                           "members": len(m.members), "party": m.is_party, "active": m.alive, "economic": round(m.platform["economic"], 2),
-                                          "last votes": m.seats_won} for m in w.movements.values()]), hide_index=True, use_container_width=True)
+                                          "last votes": m.seats_won} for m in w.movements_here()]), hide_index=True, use_container_width=True)
+          council = [c for c in w.alive() if c.role == "councillor"]
+          st.markdown("#### Council of " + esc(VILLAGE_NOW.name))
+          st.markdown(" · ".join(f"**{esc(c.name)}** ({c.reputation:+.2f})" for c in council) or "_The council house is empty._")
+          st.markdown("#### The river and the realm")
+          st.dataframe(pd.DataFrame([{"village": v.name, "element": v.element, "takes of the flow": f"{v.diversion*100:.0f}%",
+                                      "gets of its need": f"{v.water_met*100:.0f}%", "morale": round(v.morale, 2),
+                                      "wars won/lost": f"{v.wars_won}/{v.wars_lost}",
+                                      "status": "ruins" if v.fallen else (f"held by {w.villages[v.occupier].name}" if v.occupier is not None else "free"),
+                                      **{f"tension→{o.element}": round(v.tension.get(o.idx, 0), 2) for o in w.villages if o.idx != v.idx}}
+                                     for v in w.villages]), hide_index=True, use_container_width=True)
+          if w.wars:
+              st.dataframe(pd.DataFrame([{"war": f"{w.villages[x['a']].name} vs {w.villages[x['b']].name}", "over": x.get("reason", ""),
+                                          "from day": x["start"], "to day": x.get("end", "—"), "battles": x["battles"],
+                                          "dead": x["dead"][x["a"]] + x["dead"][x["b"]],
+                                          "winner": w.villages[x["winner"]].name if x.get("winner") is not None else ("—" if x.get("active") else "nobody")}
+                                         for x in w.wars[::-1]]), hide_index=True, use_container_width=True)
       with b:
           st.markdown("#### Social graph")
           g = w.social_graph()
@@ -795,18 +980,61 @@ try:
               except Exception as e:
                   st.error(f"store read failed: {e}")
           st.markdown("#### Full event log")
-          st.dataframe(w.events_df(400)[["day", "category", "importance", "text", "brain"]], hide_index=True, use_container_width=True, height=700)
+          evs = [e for e in reversed(w.events) if (IS_GOD or not e.secret) and (e.village in (w.focus, -1) or st.session_state.get("ev_all"))][:400]
+          st.toggle("Every village", key="ev_all")
+          st.dataframe(pd.DataFrame([{"day": e.day, "where": w.villages[e.village].name if e.village >= 0 else "realm", "category": e.category,
+                                      "importance": round(e.importance, 2), "text": ("🔒 " if e.secret else "") + e.text, "brain": e.brain} for e in evs]),
+                       hide_index=True, use_container_width=True, height=700)
 
   # ------------------------------------------------------------------ RESEARCH
 
   if page == PAGES[5]:
       rid = ss.get("resident_id")
-      if rid and rid not in w.citizens:
+      if rid and rid not in w.citizens and rid not in w.animals:
           rid = ss.resident_id = None
       m1, m2 = st.columns([1, 1.1])
       with m1:
-          if not rid:
-              st.markdown("#### Move your own person into the village")
+          if rid and rid in w.animals:
+              animal_steward(w.animals[rid])
+          elif not rid:
+              st.markdown("#### Move someone into the realm")
+              mk1, mk2 = st.columns(2)
+              who_kind = mk1.radio("Who", ["A person", "An animal"], horizontal=True, label_visibility="collapsed", key="mi_kind")
+              home_v = mk2.selectbox("Village", list(range(len(w.villages))), index=w.focus, key="mi_village",
+                                     format_func=lambda i: f"{ELEMENTS[w.villages[i].element]['emblem']} {w.villages[i].name} — {w.villages[i].element}",
+                                     label_visibility="collapsed")
+              st.caption(ELEMENTS[w.villages[home_v].element]["blurb"].capitalize() + ". Magic can't be given to them — "
+                         "they can only earn it, by years of practice.")
+          if not rid and st.session_state.get("mi_kind") == "An animal":
+              with st.form("move_in_animal", border=True):
+                  an_name = st.text_input("Name", placeholder="Ember")
+                  sp_opts = list(animal_sys.SPECIES)
+                  an_sp = st.selectbox("Species", sp_opts, format_func=lambda k: f"{animal_sys.SPECIES[k]['emoji']} {k}" + (" · wild" if animal_sys.SPECIES[k]["wild"] else " · tame"))
+                  an_back = st.text_area("Their story", placeholder="A one-eyed tiger who came down from the ash fields after the lava took her den.", height=70)
+                  t1, t2 = st.columns(2)
+                  bold = t1.slider("Timid ↔ bold", 0.0, 1.0, 0.6)
+                  aggr = t2.slider("Gentle ↔ fierce", 0.0, 1.0, 0.4)
+                  loyal = t1.slider("Independent ↔ loyal", 0.0, 1.0, 0.6)
+                  cur = t2.slider("Wary ↔ curious", 0.0, 1.0, 0.6)
+                  an_sponsor = st.text_input("Your name (shown as sponsor)", placeholder="om")
+                  go_animal = st.form_submit_button("Release them 🐾", type="primary", use_container_width=True)
+              if go_animal and realm_full():
+                  st.error("The realm is full for now.")
+              elif go_animal:
+                  a = animal_sys.adopt(w, an_name, an_sp, int(st.session_state.get("mi_village", w.focus)), sponsor=an_sponsor, backstory=an_back,
+                                       temperament={"boldness": bold, "aggression": aggr, "loyalty": loyal, "curiosity": cur})
+                  token = secrets.token_urlsafe(18)
+                  ss.resident_id = a.id; ss.steward_token = token; ss.sponsor_name = an_sponsor.strip(); ss.pending_village = a.village
+                  if PUBLIC:
+                      shared["residents"][a.id] = an_sponsor.strip() or "anonymous"
+                      try:
+                          shared["store"].write_resident(VILLAGE, {"citizen_id": a.id, "name": a.name, "sponsor": an_sponsor.strip(), "provider": "animal",
+                                                                   "model": a.species, "base_url": None, "enc_key": None, "max_calls": 0, "token_hash": token_hash(token)})
+                          shared["recorder"].flush(w, force_snapshot=True)
+                      except Exception as e:
+                          st.warning(f"Saved in memory but not to the store: {e}")
+                  st.rerun()
+          elif not rid:
               st.caption("Give them a name, a temperament and a story. Bring your own key (any provider) and *they* think with your model — "
                          "their reactions cost you, not the host. Keys stay in server memory for this run only (encrypted at rest if the host set a secret). "
                          + ("You're in the **public village**, so everyone here will meet them." if PUBLIC else "You're in a private world — switch to the public village in Settings if you want others to meet them."))
@@ -842,8 +1070,8 @@ try:
               if go_in:
                   if not name.strip():
                       st.error("They need a name.")
-                  elif PUBLIC and sum(1 for c in w.citizens.values() if c.sponsor and c.alive) >= int(os.environ.get("MAX_RESIDENTS", 60)):
-                      st.error("The village is full for now.")
+                  elif realm_full():
+                      st.error("The realm is full for now.")
                   else:
                       brain = None
                       if r_key.strip() or r_prov in ("ollama", "custom"):
@@ -857,7 +1085,8 @@ try:
                           except Exception as e:
                               st.error(f"That key/model didn't answer ({scrub(e)}). They'll move in with the rules brain instead.")
                       c = w.adopt(name, sex, int(age), {"openness": openness, "conscientiousness": consc, "extraversion": extra, "agreeableness": agree, "neuroticism": neuro},
-                                  backstory=backstory, sponsor=sponsor, brain=brain)
+                                  backstory=backstory, sponsor=sponsor, brain=brain, village=int(st.session_state.get("mi_village", w.focus)))
+                      ss.pending_village = c.village
                       token = secrets.token_urlsafe(18)
                       ss.resident_id = c.id; ss.selected = c.id; ss.steward_token = token; ss.sponsor_name = sponsor.strip()
                       if PUBLIC:
@@ -876,7 +1105,7 @@ try:
                       claim = st.text_input("Paste your claim token", type="password", max_chars=100)
                       if st.form_submit_button("Claim") and claim_person(claim):
                           st.rerun()
-          else:
+          elif rid in w.citizens:
               c = w.citizens[rid]
               brain = w.brains.get(rid)
               st.markdown(f"#### You are the steward of {c.name}")
@@ -976,7 +1205,7 @@ try:
                                   st.error(f"Didn't answer: {scrub(e)}")
                   st.markdown("**Tell them what to do**")
                   with st.form("instruct", clear_on_submit=True, border=False):
-                      instr = st.text_area("Instruction", placeholder="Get a better-paid job · Court Otto Petrov · Save up and open a tavern · Join the Workers' Circle · Make peace with your brother", label_visibility="collapsed", height=70)
+                      instr = st.text_area("Instruction", placeholder="Get a better-paid job · Court Otto Petrov · Steal from the richest merchant · Burn down the tavern · Practise the old arts · Move to Galehaven", label_visibility="collapsed", height=70)
                       sent = st.form_submit_button("Send", use_container_width=True, type="primary")
                   instr = clean_text(instr, 1000)
                   wait_s = limiters()["instruct"].cooldown(f"instr:{ss.sid}", 8.0)
@@ -994,7 +1223,7 @@ try:
                       if plan is None:
                           plan = rules_interpret_person(w, c, instr.strip())
                           if plan is None:
-                              st.warning("Without a model of their own, only simple verbs work: get a job, quit, open a tavern, move, join, or a goal name.")
+                              st.warning("Couldn't read that without a model. Try a verb: steal, fight, court, marry, pray, practise, enlist, emigrate to <village>, get a job, quit…")
                       if plan:
                           if plan.get("reply"):
                               w.think(c, plan["reply"], "llm" if brain is not None else "rules", "neutral")
@@ -1063,11 +1292,27 @@ try:
                       near = h1_.selectbox("Move near", [None] + known, format_func=lambda x: "anywhere" if x is None else x.name, label_visibility="collapsed")
                       if h2_.button("Move house", use_container_width=True):
                           run_plan({"effects": [{"op": "move", "params": {"near": near.name if near else ""}}]}, "move house")
+                      e1_, e2_ = st.columns([2, 1])
+                      dest = e1_.selectbox("Emigrate to", [v.idx for v in w.villages if v.idx != c.village], format_func=lambda i: w.villages[i].name, label_visibility="collapsed")
+                      if e2_.button("Emigrate", use_container_width=True):
+                          run_plan({"effects": [{"op": "emigrate", "params": {"to": w.villages[dest].element}}]}, f"emigrate to {w.villages[dest].name}")
+                      st.markdown("<div style='font-size:12px;color:#8b98a8'>Do anything — they will</div>", unsafe_allow_html=True)
+                      d1_, d2_ = st.columns([2, 1])
+                      act_key = d1_.selectbox("Act", sorted(behaviour.ACTS), format_func=lambda k: k.replace("_", " "), label_visibility="collapsed")
+                      if d2_.button("Do it", use_container_width=True):
+                          run_plan({"effects": [{"op": "act", "params": {"act": act_key, "who": who.name if who else None}}]}, f"{act_key.replace('_', ' ')} ({who.name if who else ''})")
                   if st.button("Leave town for good (remove your person)"):
                       from civilisation.systems.lifecycle import die
                       die(w, c, "left town")
                       ss.resident_id = None; ss.steward_token = None; st.rerun()
       with m2:
+          if rid and rid in w.animals:
+              a = w.animals[rid]
+              st.markdown(f"#### {a.name}'s days")
+              for m in a.memories[-14:][::-1]:
+                  st.markdown(f"<div class='mem'><b>Day {m.day}</b><i>{esc(m.text)}</i></div>", unsafe_allow_html=True)
+              if not a.memories:
+                  st.caption("Nothing yet — let a few days pass.")
           if rid and rid in w.citizens:
               c = w.citizens[rid]
               brain = w.brains.get(rid)
@@ -1090,10 +1335,14 @@ try:
                   st.markdown(w.biography(rid))
           st.markdown("#### Residents")
           sponsored = [c for c in w.citizens.values() if c.sponsor]
-          if sponsored:
-              st.dataframe(pd.DataFrame([{"name": c.name, "sponsor": c.sponsor, "age": c.age_on(w.day), "job": job_label(w, c.job), "alive": c.alive,
+          pets = [a for a in w.animals.values() if a.sponsor]
+          if sponsored or pets:
+              st.dataframe(pd.DataFrame([{"name": c.name, "village": w.villages[c.village].name, "sponsor": c.sponsor, "age": c.age_on(w.day),
+                                          "job": job_label(w, c.job), "alive": c.alive,
                                           "mind": f"{w.brains[c.id].provider}/{w.brains[c.id].model}" if c.id in w.brains else "rules",
-                                          "friends": sum(1 for r in c.relationships.values() if r.score >= 40)} for c in sponsored]),
+                                          "friends": sum(1 for r in c.relationships.values() if r.score >= 40)} for c in sponsored]
+                                        + [{"name": a.name, "village": w.villages[a.village].name, "sponsor": a.sponsor, "age": a.age_on(w.day),
+                                            "job": a.species, "alive": a.alive, "mind": "instinct", "friends": 1 if a.owner_id else 0} for a in pets]),
                            hide_index=True, use_container_width=True)
           else:
               st.caption("Nobody has moved in yet.")
@@ -1125,7 +1374,7 @@ try:
       s1, s2 = st.columns(2)
       with s1:
           seed = st.number_input("Seed", 0, 999999, w.seed)
-          pop = st.number_input("Founding population", 20, 400, 100, step=10)
+          pop = st.number_input("Founding population (split across the five villages)", 50, 1000, 300, step=25)
           era_pick = st.selectbox("Era", list(ERAS), index=list(ERAS).index(w.config.get("era", "medieval")),
                                   format_func=lambda k: f"{ERAS[k]['label']} — from {ERAS[k]['start_year'] if ERAS[k]['start_year'] > 0 else str(-ERAS[k]['start_year']) + ' BC'}: {ERAS[k]['blurb']}")
           st.markdown("#### Which world")
@@ -1230,7 +1479,10 @@ try:
               if os.path.exists("world.pkl") and st.button("Load world.pkl"):
                   ss.world = World.load("world.pkl"); ss.playing = False; ss.pop("iso_html", None); st.rerun()
           st.markdown("#### About")
-          st.markdown("New Haven v0.2 · deterministic core · optional LLM cognition gated by event importance · MIT")
+          st.markdown("New Haven v0.3 · five elemental villages on one river · a behaviour engine of situations, feelings and a loaded die · "
+                      "optional LLM minds gated by event importance · MIT")
+          st.caption("3D models: people and most animals by Quaternius (CC0 — Universal Animation Library, Animated Animal Pack). "
+                     "Bear, tiger, lion, elephant and eagle by Poly by Google (CC-BY 3.0, via poly.pizza). Full list in static/models/CREDITS.md.")
 
 
 finally:

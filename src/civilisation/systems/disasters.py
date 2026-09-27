@@ -150,7 +150,8 @@ def inject(world, name: str, **kw):
             age = rng.randint(18, 45)
             c = Citizen(id=world._new_id(), name=world.new_name(sex), sex=sex, born_day=world.day - age * 365,
                         personality={k: float(np.clip(rng.gauss(0.5, 0.18), 0.02, 0.98)) for k in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")},
-                        money=rng.uniform(50, 400), home=world._random_home(), education=rng.uniform(0.2, 0.8), skill=rng.uniform(0.2, 0.7), goal="earn money")
+                        money=rng.uniform(50, 400), home=world._random_home(), education=rng.uniform(0.2, 0.8), skill=rng.uniform(0.2, 0.7), goal="earn money",
+                        village=world.focus, origin=world.focus)
             c.pos = c.home
             c.surname = c.name.split()[-1]
             from . import politics
@@ -259,7 +260,8 @@ def daily(world):
     if world.pandemic:
         _pandemic_tick(world)
     if world.day % 30 == 0:
-        starved = [c for c in world.citizens.values() if c.cause_of_death == "starvation" and c.died_day and world.day - c.died_day < 30]
+        starved = [c for c in world.citizens.values() if c.cause_of_death == "starvation" and c.died_day and world.day - c.died_day < 30
+                   and c.village == world.focus]
         if len(starved) >= 3:
             world.emit("disaster", f"Famine: {len(starved)} people starved to death this month with bread at £{world.food_price:.0f}.",
                        0.85, [c.id for c in world.alive() if c.hunger > 0.6][:3])

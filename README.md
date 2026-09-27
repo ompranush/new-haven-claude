@@ -2,7 +2,9 @@
 
 > **Small people. Big stories.**
 
-New Haven is an agent-based civilisation simulator. A hundred settlers land on a riverbank with a personality, some money and a goal. Then you let them live: they work, trade, marry, gossip, hold grudges, have children who inherit their temperament, go hungry, get angry, found political movements, strike, vote, and die. Nothing in the story is scripted — the parties, the famines, the dynasties and the revolutions all emerge from the rules.
+New Haven is an agent-based civilisation simulator. Five villages — **Sky, Air, Earth, Fire and Water** — share one river that is never quite enough. Upstream villages dam it; downstream fields crack; councils raid, parley, pay tribute and go to war. Inside each village people work, trade, marry, gossip, steal, brawl, murder, riot, found parties, get caught (or don't) and die — and somewhere in each village a secret circle of mages keeps the old power, waiting for the day their village is taken. Nothing is scripted.
+
+Every sim decides through the **behaviour engine**: what happens to them is read as one of ~55 real-life situations; it stirs a feeling by an amount their temperament sets (the same insult barely moves a steady person and sets a hot-tempered one boiling); six plausible responses are drawn (each at least 10% relevant to the situation) and a **die loaded by temperament, the strength of the feeling, their goal and their history** with whoever is involved is rolled. Nobody's path is formulaic, and nothing is forbidden — conscience only loads the die.
 
 The whole thing runs **with zero LLM calls**. A language model is an *optional* cognition layer that is consulted only when something important happens to someone — and even then it just answers one question: *"given who you are and what you remember, how do you react?"*
 
@@ -36,6 +38,12 @@ The renderer is [`iso.py`](src/civilisation/iso.py): a self-contained HTML canva
 
 | Layer | What it does |
 |---|---|
+| `realm.py` | The five villages: each has its own government, treasury, granary, prices, police, border force and council. `World` *focuses* one village at a time, so the single-town systems below run once per village. |
+| `behaviour.py` | The behaviour engine: situations, ~80 acts (from shrugging it off to arson), feelings with depth and temperament-scaled fade, goals that always pull (daily ambitions), six options per decision and a loaded die. |
+| `systems/crime.py` | Offences, witnesses, police strength, bribes, jail, exile, hanging — consequences, never prohibitions. |
+| `systems/river.py` · `systems/war.py` | Water flows upstream→downstream; diversion and dams; thirst and blame; councils decide weekly (raid, parley, threaten, tribute, war); battles with real deaths; surrender terms; occupation; villages that fall to ruin. |
+| `systems/magic.py` | Secret elemental circles: earned by practice or awakening (god can grant; stewards cannot), revealed in war, rising to free an occupied village or lead its survivors home. |
+| `systems/animals.py` | 13 species, wild and tame; predators, hunting, breeding; visitors can move an animal in. |
 | `models.py` | Plain dataclasses: `Citizen` (Big Five personality, needs, skills, beliefs, memories, relationships), `Business`, `Movement`, `Policy`, `Memory`, `Relationship`, `WorldEvent` |
 | `terrain.py` | Procedural map: river, farmland, forest, ore hills, a plaza, roads |
 | `world.py` | The `World`: owns state, runs the systems each day, records metrics, gates the brain, keeps the chronicle |

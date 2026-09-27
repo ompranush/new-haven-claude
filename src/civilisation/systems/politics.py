@@ -105,8 +105,8 @@ def try_found_movement(world, c: Citizen, force: bool = False) -> bool:
     friends = [world.citizens[r.other_id] for r in c.relationships.values() if r.score >= 35 and world.citizens[r.other_id].alive]
     angry_friends = [f for f in friends if f.grievance > 0.35 and f.movement_id is None]
     if not force:
-        last = max((m.founded_day for m in world.movements.values()), default=-999)
-        if world.day - last < 90:            # one uprising at a time, please
+        last = max((m.founded_day for m in world.movements_here()), default=-999)
+        if world.day - last < 45:
             return False
         if c.grievance < 0.5 or c.personality["extraversion"] < 0.55 or len(angry_friends) < 2:
             return False
@@ -119,7 +119,7 @@ def try_found_movement(world, c: Citizen, force: bool = False) -> bool:
     platform = {"economic": float(np.clip(c.beliefs["economic"] - 0.2, -1, 1)),
                 "authority": float(np.clip(c.beliefs["authority"], -1, 1))}
     m = Movement(id=world._next_mid, name=name, founder_id=c.id, founded_day=world.day, platform=platform,
-                 members=[c.id], grievance_theme=theme)
+                 members=[c.id], grievance_theme=theme, village=c.village)
     world._next_mid += 1
     world.movements[m.id] = m
     c.movement_id = m.id
@@ -135,7 +135,7 @@ def try_found_movement(world, c: Citizen, force: bool = False) -> bool:
 
 def _recruit(world):
     rng = world.rng
-    live = [m for m in world.movements.values() if m.alive]
+    live = [m for m in world.movements_here() if m.alive]
     if not live:
         return
     adults = world.adults()
@@ -307,7 +307,7 @@ def election(world, snap: bool = False):
     adults = world.adults()
     if not adults:
         return
-    parties = [m for m in world.movements.values() if m.alive and m.is_party]
+    parties = [m for m in world.movements_here() if m.alive and m.is_party]
     incumbent_name = world.policy.ruling_party
     incumbent_platform = next((m.platform for m in parties if m.name == incumbent_name), FOUNDERS)
     candidates = {"Founders' Council": FOUNDERS} if incumbent_name == "Founders' Council" or not parties else {}
@@ -346,8 +346,8 @@ def election(world, snap: bool = False):
             else:
                 c.grievance = min(1, c.grievance + 0.05)
     if changed:
-        for c in adults:                       # a new government gets a honeymoon
-            c.grievance *= 0.6
+        for c in adults:                       # a new government gets a short honeymoon
+            c.grievance *= 0.85
             c.beliefs["trust"] = min(1, c.beliefs["trust"] + 0.1)
     lead = next((m.founder_id for m in parties if m.name == winner), None)
     kind = "Snap election" if snap else f"Election of year {world.year}"
@@ -360,6 +360,8 @@ def election(world, snap: bool = False):
         if rng.random() < 0.3:
             c.remember(world.day, f"Voted in the election. {winner} won.", "hope" if changed else "neutral", 0.4, tag="politics")
     world.next_election_day = world.day + world.config["election_period_days"]
+    from . import war
+    war.reseat_council(world, winner)
 
 
 def daily(world):
@@ -374,11 +376,56 @@ def daily(world):
         if adults and world.day > 365:
             g = float(np.mean([c.grievance for c in adults]))
             t = float(np.mean([c.beliefs["trust"] for c in adults]))
-            if g > 0.7 and t < 0.35 and world.rng.random() < 0.25:
-                world.emit("politics", f"Riots in the square: with grievance at {g*100:.0f}% and trust at {t*100:.0f}%, "
-                                       f"the {world.policy.ruling_party} was forced to call a snap election.", 1.0,
-                           [max(adults, key=lambda c: c.grievance).id])
-                election(world, snap=True)
+            if g > 0.65 and t < 0.4 and world.rng.random() < 0.1:
+                riot(world, max(adults, key=lambda c: c.grievance * (0.5 + c.personality["extraversion"])))
     _strike(world)
     if world.day >= world.next_election_day:
         election(world)
+
+
+def riot(world, leader):
+    """A mob in the square. Windows go in, the watch wades in, people die; sometimes the government goes with them."""
+    from . import crime, lifecycle, economy
+    from .. import behaviour
+    rng = world.rng
+    adults = world.adults()
+    mob = [c for c in adults if world.free(c) and (c.grievance > 0.45 or c.feel("anger") > 0.5) and c.role not in ("police", "councillor")]
+    if leader not in mob:
+        mob.append(leader)
+    if len(mob) < 4:
+        world.emit("politics", f"{leader.name} tried to rouse a mob in {world.name}; a handful came, and went home.", 0.4, [leader.id], kind="petition")
+        return
+    police = [c for c in adults if c.role == "police" and world.free(c)]
+    x, y = world.village.centre
+    world.add_fx("riot", x, y, days=3)
+    wrecked, dead = [], []
+    for b in rng.sample(world.open_businesses(), min(len(world.open_businesses()), 1 + len(mob) // 8)):
+        b.cash -= rng.uniform(300, 1200)
+        if b.cash < -300 and rng.random() < 0.5:
+            economy.bankrupt(world, b)
+            wrecked.append(b.name)
+    clash = min(len(police), len(mob)) * rng.uniform(0.1, 0.4)
+    for c in rng.sample(mob + police, min(len(mob + police), int(clash) + 1)):
+        c.health -= rng.uniform(0.15, 0.6)
+        if c.health <= 0.02:
+            lifecycle.die(world, c, "the riot")
+            dead.append(c.name)
+    for c in mob:
+        behaviour.stir(c, "anger", 0.2, rng)
+    text = (f"Riot in {world.name}: {len(mob)} people led by {leader.name} tore through the square"
+            + (f", wrecking {', '.join(wrecked)}" if wrecked else "") + (f"; {', '.join(dead[:3])} died" if dead else "") + ".")
+    crime.commit(world, leader, "rioting", None, text, 0.9, witnesses=len(mob))
+    # a big enough mob against a weak watch takes the council house
+    if len(mob) > max(8, 2.5 * len(police)) and world.policy.approval < 0.45 and rng.random() < 0.35:
+        m = world.movements.get(leader.movement_id) if leader.movement_id else None
+        name = m.name if m else f"{leader.surname}'s Committee"
+        plat = m.platform if m else {"economic": float(np.clip(leader.beliefs["economic"] - 0.3, -1, 1)), "authority": float(np.clip(leader.beliefs["authority"] + 0.3, -1, 1))}
+        old = world.policy.ruling_party
+        apply_platform(world, plat, name)
+        from . import war
+        war.reseat_council(world, name)
+        leader.role = "councillor"
+        world.emit("politics", f"The mob stormed the council house. {old} is overthrown; {leader.name} rules {world.name} now.", 1.0,
+                   [leader.id], kind="won_office", tone="good")
+    elif rng.random() < 0.5:
+        election(world, snap=True)

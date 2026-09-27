@@ -22,11 +22,18 @@ MAX_EMPLOYEES = 8
 
 def pick_site(world, kind):
     target = SITE_FOR_KIND.get(kind)
+    cx, cy = world.village.centre
     if target is not None:
-        tiles = terrain.find_tiles(world.grid, target)
+        tiles = world.tiles([target])
+        if kind == "farm" and not tiles:
+            tiles = world.tiles([terrain.GRASS, terrain.SAND, terrain.ASH])
+        if kind == "mine" and not tiles:
+            tiles = world.tiles([terrain.SNOW, terrain.ASH, terrain.FOREST])
     else:
-        tiles = terrain.find_tiles(world.grid, terrain.TOWN) + terrain.find_tiles(world.grid, terrain.GRASS)[:200]
-    taken = {(b.x, b.y) for b in world.businesses.values()}
+        tiles = [t for t in world.tiles([terrain.TOWN, terrain.GRASS, terrain.SAND, terrain.ASH])
+                 if abs(t[0] - cx) + abs(t[1] - cy) <= 12]
+    tiles = tiles or [world.village.centre]
+    taken = {(b.x, b.y) for b in world.businesses.values() if b.alive}
     free = [t for t in tiles if t not in taken] or tiles
     return world.rng.choice(free)
 
@@ -43,7 +50,8 @@ def hire(world, c: Citizen, b: Business):
 
 def farm_yield(world) -> float:
     """Food units one farmer grows per day right now (drought, technology)."""
-    return FOOD_PER_FARMER * 0.9 * world.tech * (0.45 if world.drought_days > 0 else 1.0)
+    from .river import farm_factor
+    return FOOD_PER_FARMER * 0.9 * world.tech * (0.45 if world.drought_days > 0 else 1.0) * farm_factor(world.village)
 
 
 def needs_staff(b: Business, food_price: float = 0.0, world=None) -> bool:
@@ -96,7 +104,8 @@ def daily(world):
     demand_mult = cfg["demand_multiplier"] * (0.5 if world.recession_days > 0 else 1.0) * (1.4 if world.boom_days > 0 else 1.0) \
         * (1.2 if "tax_holiday" in laws else 1.0) * (0.7 if "quarantine" in laws else 1.0)
     striking = set(world.strike["members"]) if world.strike else set()
-    drought = 0.45 if world.drought_days > 0 else 1.0
+    from .river import farm_factor
+    drought = (0.45 if world.drought_days > 0 else 1.0) * farm_factor(world.village)      # the river decides the harvest
 
     # ---- production
     open_bs = world.open_businesses()
@@ -127,7 +136,7 @@ def daily(world):
 
     # ---- prices: a week of reserves is "normal"
     weekly_need = max(1.0, len(alive) * 7.0)
-    world.food_price = float(np.clip(3.5 * (weekly_need / max(1.0, world.food)) ** 0.5, 1.0, 12.0))
+    world.food_price = float(np.clip(3.5 * (weekly_need / max(1.0, world.food)) ** 0.5, 1.0, 40.0))
     market_price = world.food_price
     world.market_price = market_price
     if "rationing" in laws and world.treasury > 0:
@@ -140,6 +149,9 @@ def daily(world):
     goods_bs = [b for b in open_bs if b.kind != "farm"]
     food_revenue = 0.0
     for c in alive:
+        if not world.free(c):
+            c.hunger = max(0.0, c.hunger - 0.3)       # the cells serve gruel
+            continue
         age = c.age_on(world.day)
         # eat: children are fed by parents (we just charge the world's food)
         if world.food >= 1.0 and (c.money >= world.food_price or age < 18 or "rationing" in laws):
@@ -321,8 +333,8 @@ def daily(world):
             world.emit("economy", f"{c.name} founded {b.name}.", 0.5, [c.id])
             c.remember(world.day, f"I opened {b.name} with my savings.", "pride", 0.7, tag="economy")
 
-    # ---- no farms at all: the council opens one on the commons before the town starves
-    if not any(b.kind == "farm" for b in world.open_businesses()) and world.treasury > 500 and adults:
+    # ---- no farms at all: a council *might* open one on the commons before the town starves
+    if not any(b.kind == "farm" for b in world.open_businesses()) and world.treasury > 500 and adults and rng.random() < 0.08:
         steward = max((c for c in adults if c.employer_id is None), key=lambda c: c.skill, default=rng.choice(adults))
         world.treasury -= 500
         if steward.employer_id is not None:

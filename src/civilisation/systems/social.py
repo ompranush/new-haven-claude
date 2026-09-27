@@ -9,8 +9,13 @@ from ..models import (Citizen, REL_SPOUSE, REL_FAMILY, REL_FRIEND, REL_COLLEAGUE
                       REL_ACQUAINTANCE, REL_RIVAL, REL_ENEMY)
 
 
+def _clip(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
+
+
 def compatibility(a: Citizen, b: Citizen) -> float:
-    return 1 - float(np.mean([abs(a.personality[k] - b.personality[k]) for k in a.personality]))
+    pa, pb = a.personality, b.personality
+    return 1 - sum(abs(pa[k] - pb[k]) for k in pa) / len(pa)
 
 
 def _rekind(r, other_r):
@@ -34,8 +39,8 @@ def adjust(world, a: Citizen, b: Citizen, delta: float):
     def damp(score, d):
         same_dir = (d > 0 and score > 0) or (d < 0 and score < 0)
         return d * (1 - abs(score) / 105) if same_dir else d
-    ra.score = float(np.clip(ra.score + damp(ra.score, delta), -100, 100))
-    rb.score = float(np.clip(rb.score + damp(rb.score, delta * 0.7), -100, 100))
+    ra.score = float(_clip(ra.score + damp(ra.score, delta), -100, 100))
+    rb.score = float(_clip(rb.score + damp(rb.score, delta * 0.7), -100, 100))
     ra.last_interaction = rb.last_interaction = world.day
     ra.interactions += 1
     rb.interactions += 1
@@ -51,7 +56,7 @@ def _move(world, c: Citizen):
         return
     if c.employer_id is not None and (not world.strike or c.id not in world.strike["members"]):
         b = world.businesses[c.employer_id]
-        c.pos = (b.x + rng.randint(-1, 1), b.y + rng.randint(-1, 1))
+        c.pos = (b.x + rng.randint(-2, 2), b.y + rng.randint(-2, 2))
     elif c.age_on(world.day) < 18:
         school = next((b for b in world.open_businesses() if b.kind == "school"), None)
         c.pos = (school.x + rng.randint(-1, 1), school.y + rng.randint(-1, 1)) if school and rng.random() < 0.7 else c.home
@@ -59,10 +64,10 @@ def _move(world, c: Citizen):
         taverns = [b for b in world.open_businesses() if b.kind in ("tavern", "market")]
         if taverns and rng.random() < 0.3 + 0.4 * c.personality["extraversion"]:
             t = rng.choice(taverns)
-            c.pos = (t.x + rng.randint(-2, 2), t.y + rng.randint(-2, 2))
+            c.pos = (t.x + rng.randint(-3, 3), t.y + rng.randint(-3, 3))
         else:
             c.pos = (c.home[0] + rng.randint(-2, 2), c.home[1] + rng.randint(-2, 2))
-    c.pos = (int(np.clip(c.pos[0], 0, world.width - 1)), int(np.clip(c.pos[1], 0, world.height - 1)))
+    c.pos = (int(_clip(c.pos[0], 0, world.width - 1)), int(_clip(c.pos[1], 0, world.height - 1)))
 
 
 def _pick_partner(world, c: Citizen, alive_ids, by_pos):
@@ -175,8 +180,8 @@ def gossip(world, c: Citizen):
         s = world.citizens.get(subject)
         if s and s.alive and subject != f.id:
             sign = -1 if m.emotion in ("anger", "fear", "shame") else 1
-            f.rel(subject).score = float(np.clip(f.rel(subject).score + sign * 4, -100, 100))
-            s.reputation = float(np.clip(s.reputation + sign * 0.01, -1, 1))
+            f.rel(subject).score = float(_clip(f.rel(subject).score + sign * 4, -100, 100))
+            s.reputation = float(_clip(s.reputation + sign * 0.01, -1, 1))
 
 
 def daily(world):

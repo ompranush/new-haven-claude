@@ -82,7 +82,7 @@ def test_pandemic_spreads_and_ends():
 
 
 def test_automation_creates_unemployment():
-    w = World(seed=8, population=100, config={"random_shocks": False})
+    w = World(seed=8, population=300, config={"random_shocks": False})
     w.step(200)
     before = w.unemployment
     w.inject("automation", share=0.5)
@@ -108,7 +108,7 @@ def test_reaction_applies():
     r.apply(w, c, ev)
     assert c.rel(o.id).score <= -30
     assert c.grievance >= 0.2
-    assert c.memories[-1].text == "Never again."
+    assert c.memories[-1].text.startswith("Never again.")        # followed by what they did about it
 
 
 def test_politics_can_emerge_under_hardship():
@@ -280,7 +280,7 @@ def test_adopted_citizens_are_always_countable():
     anon = w.adopt("Bea Two", "F", 30, {}, "x", sponsor="")
     assert named.sponsor == "om" and anon.sponsor == "anonymous"
     assert len([c for c in w.citizens.values() if c.sponsor]) == 2
-    arrivals = [e.text for e in w.events if "arrived in town" in e.text]
+    arrivals = [e.text for e in w.events if " arrived in " in e.text]
     assert any("sent by om" in t for t in arrivals) and not any("sent by anonymous" in t for t in arrivals)
 
 
@@ -365,15 +365,16 @@ def test_line_passes_to_an_heir(tmp_path, monkeypatch):
     from civilisation.brains import RulesBrain
     from civilisation.systems.lifecycle import die, make_child
     store = SQLiteStore(str(tmp_path / "h.db"))
-    w = World(seed=21, population=60)
+    w = World(seed=21, population=150)
     w.step(200)
-    mine = w.adopt("Ada Line", "F", 30, {}, "The first of us.", sponsor="om", brain=RulesBrain())
+    mine = w.adopt("Ada Line", "F", 30, {}, "The first of us.", sponsor="om", brain=RulesBrain(), village=0)
     partner = next(c for c in w.alive() if c.id != mine.id and not c.spouse_id and c.age_on(w.day) >= 22)
     mine.spouse_id, partner.spouse_id = partner.id, mine.id
     kid = make_child(w, mine, partner)
     store.write_resident("v", {"citizen_id": mine.id, "name": mine.name, "sponsor": "om", "provider": "anthropic",
                                "model": "claude-opus-5", "enc_key": None, "max_calls": 200, "token_hash": "TOKEN"})
-    w.step(365 * 20)                                  # the child grows up
+    kid.born_day -= 20 * 365                          # the child grows up
+    w.step(30)
     die(w, mine, "old age")
     heirs = w.heirs_of(mine.id)
     assert kid.id in [h.id for h in heirs]
@@ -394,3 +395,15 @@ def test_relative_arrives_when_no_heirs():
     assert not w.heirs_of(mine.id)
     rel = w.adopt_relative(mine.id)
     assert rel.surname == mine.surname and rel.sponsor == "om" and rel.alive
+
+
+def test_relationships_respect_dunbars_number():
+    """Nobody keeps more than the cap in mind, and family is never the thing dropped."""
+    w = World(seed=31, population=150, config={"max_relationships": 40})
+    w.step(365 * 3)
+    w.prune()
+    cap = w.config["max_relationships"]
+    assert all(len(c.relationships) <= cap for c in w.alive())
+    for c in w.alive():
+        if c.spouse_id and w.citizens[c.spouse_id].alive:
+            assert c.spouse_id in c.relationships, "a spouse was forgotten to make room"

@@ -81,6 +81,26 @@ class Citizen:
     last_wage: float = 0.0
     backstory: str = ""               # who they say they are (sponsored citizens)
     sponsor: str = ""                 # display name of the person who adopted them, if any
+    village: int = 0                  # index into World.villages
+    emotions: Dict[str, float] = field(default_factory=dict)   # live feelings 0..1 that rise with events and fade with time
+    role: str = ""                    # councillor | police | guard | "" — public office, paid by the village
+    magic: Optional[dict] = None      # {"element", "power" 0..1, "practice" 0..1, "revealed": bool} — secret unless revealed
+    jailed_until: int = -1            # day they walk free
+    crimes: int = 0                   # offences they got away with or were caught for
+    convictions: int = 0
+    exiled_from: Optional[int] = None
+    last_initiative: int = -999       # last day they acted on their own ambition
+    origin: int = 0                   # village they were born in (refugees and exiles keep it)
+    goal_target: Optional[int] = None # who a revenge is aimed at
+
+    def feel(self, emotion: str) -> float:
+        return self.emotions.get(emotion, 0.0)
+
+    def dominant(self):
+        if not self.emotions:
+            return "neutral", 0.0
+        k = max(self.emotions, key=self.emotions.get)
+        return (k, self.emotions[k]) if self.emotions[k] > 0.05 else ("neutral", 0.0)
 
     def age_on(self, day: int) -> int:
         return max(0, (day - self.born_day) // 365)
@@ -123,6 +143,7 @@ class Business:
     closed_day: Optional[int] = None
     loss_days: int = 0
     livestock: int = 0               # farms keep a herd; it grazes on the map and adds to the food supply
+    village: int = 0
 
 
 @dataclass
@@ -138,6 +159,7 @@ class Movement:
     alive: bool = True
     grievance_theme: str = "hardship"
     last_strike_day: int = -999
+    village: int = 0
 
 
 @dataclass
@@ -164,3 +186,49 @@ class WorldEvent:
     actors: List[int] = field(default_factory=list)
     brain: str = ""                   # which brain (if any) processed this event
     tone: str = ""                    # "good" / "bad" / "" — how it lands on the first actor
+    village: int = -1                 # where it happened (-1: across the realm)
+    kind: str = ""                    # situation key the behaviour engine understands (see behaviour.SITUATIONS)
+    secret: bool = False              # only god sees it (the secret societies)
+
+
+@dataclass
+class Animal:
+    """An animal living in or around a village. Wild ones roam; tame ones bond with a person."""
+    id: int
+    name: str
+    species: str
+    sex: str
+    born_day: int
+    village: int
+    home: Tuple[int, int] = (0, 0)
+    pos: Tuple[int, int] = (0, 0)
+    health: float = 1.0
+    hunger: float = 0.1
+    temperament: Dict[str, float] = field(default_factory=dict)   # boldness, aggression, loyalty, curiosity
+    emotions: Dict[str, float] = field(default_factory=dict)
+    owner_id: Optional[int] = None
+    bond: float = 0.0                 # 0..1 attachment to the owner
+    wild: bool = True
+    alive: bool = True
+    died_day: Optional[int] = None
+    cause_of_death: Optional[str] = None
+    memories: List[Memory] = field(default_factory=list)
+    sponsor: str = ""
+    backstory: str = ""
+    doing: str = "wandering"
+    kills: int = 0
+    magic: Optional[dict] = None      # only god can grant an animal power
+
+    def age_on(self, day: int) -> int:
+        return max(0, (day - self.born_day) // 365)
+
+    def feel(self, emotion: str) -> float:
+        return self.emotions.get(emotion, 0.0)
+
+    def remember(self, day: int, text: str, emotion: str = "neutral", importance: float = 0.3,
+                 about: Optional[List[int]] = None, tag: str = "life") -> Memory:
+        m = Memory(day, text, emotion, float(min(1.0, max(0.0, importance))), list(about or []), tag)
+        self.memories.append(m)
+        if len(self.memories) > 30:
+            self.memories = sorted(sorted(self.memories, key=lambda x: (x.importance, x.day), reverse=True)[:30], key=lambda x: x.day)
+        return m

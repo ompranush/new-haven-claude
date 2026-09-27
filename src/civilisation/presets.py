@@ -276,7 +276,7 @@ def school_reform(w):
 
 @preset("strike_wave", "The biggest movement calls a general strike.")
 def strike_wave(w):
-    m = max((m for m in w.movements.values() if m.alive), key=lambda m: len(m.members), default=None)
+    m = max((m for m in w.movements_here() if m.alive), key=lambda m: len(m.members), default=None)
     if m is None:
         return revival(w)
     return {"narration": f"The {m.name} called everyone out. The mills are silent and there are pickets at the ford.",

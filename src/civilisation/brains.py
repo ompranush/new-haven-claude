@@ -20,7 +20,10 @@ if TYPE_CHECKING:
     from .models import Citizen, WorldEvent
 
 ACTIONS = ["none", "avoid", "confront", "seek_support", "quit_job", "found_movement", "move_home", "donate", "reconcile"]
-EMOTIONS = ["joy", "grief", "anger", "fear", "pride", "shame", "hope", "neutral"]
+EMOTIONS = ["joy", "grief", "anger", "fear", "pride", "shame", "hope", "neutral", "envy", "love"]
+# the older, smaller action list a model may still answer with
+LEGACY = {"avoid": "walk_away", "confront": "retort", "seek_support": "seek_support", "quit_job": "quit_job",
+          "found_movement": "found_movement", "move_home": "emigrate", "donate": "gift", "reconcile": "reconcile"}
 
 
 @dataclass
@@ -33,12 +36,19 @@ class Reaction:
     belief_shift: Dict[str, float] = field(default_factory=dict)
     action: str = "none"
     source: str = "rules"
+    situation: str = ""
+    options: list = field(default_factory=list)  # [(act, probability)] — the six things they considered
+    face: int = 0                                # which of the six the die landed on
+    target: Optional[int] = None
+    level: float = 0.0
+    forget: bool = False
 
     def apply(self, world: "World", c: "Citizen", ev: "WorldEvent"):
-        from .systems import social, politics
-        c.remember(world.day, self.memory or ev.text, self.emotion, max(ev.importance, self.intensity),
-                   about=[a for a in ev.actors if a != c.id], tag=ev.category)
-        mood = {"joy": 0.12, "pride": 0.10, "hope": 0.06, "neutral": 0.0, "fear": -0.08,
+        from .systems import social
+        from . import behaviour
+        if self.source != "rules" and self.emotion in behaviour.SENSITIVITY:
+            behaviour.stir(c, self.emotion, 0.3 + 0.5 * self.intensity, world.rng)     # a model's feelings count too
+        mood = {"joy": 0.12, "pride": 0.10, "hope": 0.06, "love": 0.08, "neutral": 0.0, "fear": -0.08, "envy": -0.05,
                 "shame": -0.08, "anger": -0.06, "grief": -0.15}.get(self.emotion, 0.0)
         c.happiness = float(np.clip(c.happiness + mood * self.intensity, 0, 1))
         for oid, delta in self.relationship_changes.items():
@@ -50,42 +60,21 @@ class Reaction:
             if k in c.beliefs:
                 lo, hi = (0, 1) if k == "trust" else (-1, 1)
                 c.beliefs[k] = float(np.clip(c.beliefs[k] + float(np.clip(d, -0.3, 0.3)), lo, hi))
-        self._act(world, c, ev)
-
-    def _act(self, world: "World", c: "Citizen", ev: "WorldEvent"):
-        from .systems import social, politics, economy
-        others = [a for a in ev.actors if a != c.id and a in world.citizens]
-        if self.action == "avoid" and others:
-            for o in others:
-                c.rel(o).score -= 5
-        elif self.action == "confront" and others:
-            o = world.citizens[others[0]]
-            social.adjust(world, c, o, -10)
-            world.emit("social", f"{c.name} confronted {o.name} over it.", 0.3, [c.id, o.id])
-        elif self.action == "reconcile" and others:
-            o = world.citizens[others[0]]
-            social.adjust(world, c, o, +15)
-            world.emit("social", f"{c.name} made peace with {o.name}.", 0.3, [c.id, o.id])
-        elif self.action == "seek_support":
-            friends = [r for r in c.relationships.values() if r.score >= 40 and world.citizens[r.other_id].alive]
-            for r in friends[:3]:
-                r.score = min(100, r.score + 4)
-            c.happiness = min(1, c.happiness + 0.03 * len(friends[:3]))
-        elif self.action == "quit_job" and c.employer_id is not None:
-            economy.leave_job(world, c, reason="quit")
-            world.emit("work", f"{c.name} quit their job at {ev.text.split(' at ')[-1].rstrip('.') if ' at ' in ev.text else 'work'}.", 0.3, [c.id])
-        elif self.action == "found_movement":
-            politics.try_found_movement(world, c, force=True)
-        elif self.action == "move_home":
-            c.home = world._random_home()
-            c.pos = c.home
-        elif self.action == "donate" and c.money > 300:
-            poorest = min(world.alive(), key=lambda x: x.money)
-            gift = min(c.money * 0.1, 200)
-            c.money -= gift
-            poorest.money += gift
-            social.adjust(world, poorest, c, +12)
-            world.emit("social", f"{c.name} gave £{gift:.0f} to {poorest.name}, who was struggling.", 0.3, [c.id, poorest.id])
+        self.action = LEGACY.get(self.action, self.action)
+        line = behaviour.perform(world, c, ev, self) if self.action in behaviour.ACTS else ""
+        if not self.memory:
+            from .personality import voice
+            text = ev.text
+            if text.startswith(c.name):
+                text = "I" + text[len(c.name):]
+            else:
+                text = text.replace(c.name + "'s", "my", 1).replace(c.name, "me", 1)
+            self.memory = (voice(c, self.emotion if self.emotion in ("joy", "grief", "anger", "fear", "pride", "shame", "hope") else "neutral",
+                                 text, salt=ev.day) + (" " + line if line else "")).strip()
+        elif line and line not in self.memory:
+            self.memory = f"{self.memory} {line}"
+        weight = max(ev.importance, self.intensity) * (0.35 if self.forget else 1.0)
+        c.remember(world.day, self.memory, self.emotion, weight, about=[a for a in ev.actors if a != c.id], tag=ev.category)
 
 
 class Brain(Protocol):
@@ -94,88 +83,12 @@ class Brain(Protocol):
 
 
 class RulesBrain:
-    """Personality-driven reactions. Cheap, deterministic, surprisingly expressive."""
+    """The behaviour engine (behaviour.py): situations, feelings with depth, six options and a loaded die."""
     name = "rules"
 
     def react(self, world: "World", c: "Citizen", ev: "WorldEvent") -> Optional[Reaction]:
-        p = c.personality
-        rng = world.rng
-        others = [a for a in ev.actors if a != c.id]
-        r = Reaction(intensity=float(np.clip(ev.importance * (0.6 + 0.8 * p["neuroticism"]), 0.1, 1)))
-        cat = ev.category
-        text = ev.text.lower()
-        bad = ev.tone == "bad" or (not ev.tone and any(w in text for w in ["died", "insult", "fired", "bankrupt", "lost", "flood", "drought", "attack",
-                                       "raid", "starv", "layoff", "laid off", "collapsed", "closed", "cheated", "robbed", "mocked", "sneered", "accused", "laughed about", "crude joke", "layabout", "famine", "burst its banks", "riot"]))
-        good = ev.tone == "good" or (not ev.tone and not bad and any(w in text for w in ["married", "born", "founded", "opened", "promoted", "won", "discover",
-                                        "helped", "gave", "elected", "recovered", "hired", "took power", "raised wages"]))
-        if bad:
-            if "died" in text:
-                r.emotion = "grief"
-            elif others and (p["agreeableness"] < 0.45 or p["neuroticism"] > 0.6):
-                r.emotion = "anger"
-            elif cat in ("disaster", "economy", "work", "politics"):
-                r.emotion = "fear"
-            else:
-                r.emotion = "anger" if p["agreeableness"] < 0.6 else "fear"
-        elif good:
-            r.emotion = "pride" if (c.id in ev.actors[:1] and p["extraversion"] > 0.5) else "joy"
-        else:
-            r.emotion = "hope" if p["openness"] > 0.6 else "neutral"
-
-        # relationships: blame or credit the other actors
-        for o in others:
-            if o not in world.citizens:
-                continue
-            if r.emotion == "anger":
-                r.relationship_changes[o] = -12 - 20 * (1 - p["agreeableness"])
-            elif r.emotion in ("joy", "pride", "hope"):
-                r.relationship_changes[o] = 6 + 10 * p["agreeableness"]
-            elif r.emotion == "grief" and "died" not in text:
-                r.relationship_changes[o] = -4
-
-        # grievance & beliefs
-        if bad:
-            r.grievance_delta = 0.05 + 0.15 * ev.importance * (1 - p["agreeableness"] * 0.5)
-            if cat in ("economy", "work"):
-                r.belief_shift["economic"] = -0.06 * ev.importance      # hardship pushes left
-                r.belief_shift["trust"] = -0.04
-            if cat in ("disaster", "politics"):
-                r.belief_shift["authority"] = 0.05 * p["neuroticism"]  # fear seeks order
-                r.belief_shift["trust"] = -0.05
-        elif good:
-            r.grievance_delta = -0.05
-            r.belief_shift["trust"] = 0.03
-
-        # action selection
-        roll = rng.random()
-        if r.emotion == "anger" and others:
-            if p["extraversion"] > 0.55 and roll < 0.5:
-                r.action = "confront"
-            else:
-                r.action = "avoid"
-        elif r.emotion in ("grief", "fear"):
-            r.action = "seek_support" if p["extraversion"] > 0.4 else "none"
-            if cat == "work" and "fired" in text and p["openness"] > 0.7 and roll < 0.2:
-                r.action = "move_home"
-        elif r.emotion in ("joy", "pride") and p["agreeableness"] > 0.7 and c.money > 800 and roll < 0.25:
-            r.action = "donate"
-        if bad and c.grievance + r.grievance_delta > 0.75 and p["extraversion"] > 0.6 and c.movement_id is None and roll < 0.35:
-            r.action = "found_movement"
-        if r.emotion == "anger" and p["agreeableness"] > 0.75 and roll > 0.7 and others:
-            r.action = "reconcile"
-
-        r.memory = self._memory_text(c, ev, r)
-        return r
-
-    @staticmethod
-    def _memory_text(c: "Citizen", ev: "WorldEvent", r: Reaction) -> str:
-        from .personality import voice
-        text = ev.text
-        if text.startswith(c.name):
-            text = "I" + text[len(c.name):]
-        else:
-            text = text.replace(c.name + "'s", "my", 1).replace(c.name, "me", 1)
-        return voice(c, r.emotion, text, salt=ev.day)
+        from . import behaviour
+        return behaviour.decide(world, c, ev)
 
 
 class SilentBrain:

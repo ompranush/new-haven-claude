@@ -1,5 +1,61 @@
 # New Haven — Architecture
 
+> v0.3: five elemental villages on one river, the behaviour engine, crime, war, magic, animals and an animated 3D realm.
+> The sections below "The realm" describe the single-town systems that now run once per village.
+
+## The realm
+
+`World` holds five `Village`s (`realm.py`: sky, air, earth, fire, water — upstream to downstream) on one 90×60 map
+(`terrain.generate_realm`). Each village owns what used to be global: `policy`, `treasury`, `food`, `food_price`,
+`tech`, `history`, `strike`, `pandemic`… `World.focus` names one village, and properties on `World` delegate those
+names to it, while `alive()`, `adults()`, `open_businesses()` and `movements_here()` return only that village's. So
+the economy, social, lifecycle, politics and disasters systems — written for one town — run unchanged once per village
+inside `with world.at(idx):`. `alive_all()` / `open_businesses_all()` see the whole realm. Citizens, businesses and
+movements carry a `village`; events carry `village`, a situation `kind` and a `secret` flag (only god sees secrets).
+
+Each simulated day: `river.daily` (flow and shares) → per village: lifecycle, economy, social, politics, disasters,
+`behaviour.daily` (feelings fade, ambitions, pressures, grudges), `war.village_daily` (stipends, offices, tribute, the
+council's weekly roll) → realm: `war.daily` (battles), `magic.daily` (circles, awakenings, resurrections),
+`animals.daily`.
+
+## The behaviour engine (`behaviour.py`)
+
+1. **Situations.** `classify(world, citizen, event)` reads an event as one of ~55 situations (insulted, humiliated,
+   robbed, spouse unfaithful, loved one murdered, water cut, war declared, occupied, awakening… plus one *ambition*
+   situation per goal). Each lists responses with a relevance 0..1.
+2. **Feelings.** `stir()` raises a feeling by an amount scaled by temperament (`disposition()`: temper, conscience,
+   boldness, vengefulness, warmth, drive); `fade()` lets it ebb at a temperament-dependent rate. Bands: calm, stirred,
+   heated, boiling. Every act has a band of feeling where it is natural.
+3. **Six and a die.** `menu_for()` draws six responses at ≥10% relevance, weighted by relevance (so the menu itself
+   varies); fallbacks (holiday, singing…) enter only when fewer than six fit. `_fit()` loads each face by traits, band,
+   goal (×1.8–3.2 when the act serves it), conscience (crimes are never zero), history with the other person, hunger and
+   roots (people with jobs and families rarely emigrate). `decide()` rolls; `perform()` runs the act. The six options and
+   the face are kept on the thought (`world.thoughts[i]["options"|"face"]`) and shown in the app.
+4. **Goals.** Every day each free adult may take an initiative toward their goal through the same roll
+   (`ambition_<tag>` situations). LLM minds are shown the six options and choose one; off-menu answers fall back to the die.
+
+## Conflict (`systems/crime.py`, `river.py`, `war.py`, `magic.py`)
+
+Crimes are acts like any other. `crime.commit` records them, lets the victim react, and gives the village watch a chance
+(`police_strength`: officers per head × skill × trust × curfew). Caught: fines and jail scaled by the government's
+authority, exile, hanging; corrupt officers take bribes. Water: each village takes its need plus `diversion` of the
+flow; shortfalls hurt health and push `tension`/`grudges` toward whoever upstream diverted most. Councils roll weekly on
+wait/parley/threaten/raid/war/tribute; wars fight a battle every nine days at the border (real deaths, morale); losers
+surrender (tribute, water terms) or collapse into occupation; empty villages fall to ruin. Secret mages (3–5% at
+founding, then earned) add strength in battle and reveal themselves; an occupied village's circle rises when strong
+enough against the garrison, and a fallen village's scattered mages lead its people home.
+
+## Renderer (`scene.py`) and models (`static/models/`)
+
+three.js, served from jsdelivr; the iframe polls `static/world_<session>.json` (`iso.world_payload`). The ~60 people
+nearest the camera are rigged figures (CC0 Quaternius mannequin, 22 clips) chosen by state — walking, talking,
+working, fighting, dancing, mourning, casting, sitting in the cells; everyone else is an instanced figure. Animals use
+animated CC0 models (CC-BY Poly models for bear, tiger, lion, elephant, eagle). `world.fx` entries (meteor, fire,
+lightning, tornado, quake, flood, riot, raid, battle, spells…) become effects; `world.set_tile` changes (ash, ruins,
+dams, craters) rebuild the terrain. The camera follows the selected person, or glides to a village, front or dam.
+Model files are trimmed with `tools/repack_glb.py`; credits in `static/models/CREDITS.md`.
+
+
 New Haven is an agent-based civilisation with three kinds of participant: the **engine** (deterministic rules that run every simulated day), **language models** (consulted only when something important happens to someone), and **people** — one god who runs the world and many stewards who each look after a single citizen.
 
 ```
@@ -73,7 +129,9 @@ Two very different things go to the store, and confusing them is what nearly too
 - **The log** (`events`, `thoughts`, `metrics`) is the permanent record and is **append-only**: each flush writes only the rows created since the last one. Nothing is ever rewritten. Every interaction and every inner voice is kept by default (`STORE_MIN_IMPORTANCE=0`). The world's in-memory lists are rolling windows, so the recorder counts lifetime totals (`events_total`, `thoughts_total`) rather than list lengths, and reports `dropped` if a window ever wraps before a flush — that number must stay at zero.
 - **The snapshot** is a save-game, not a record: the whole world, pickled, gzipped and signed. It exists so a restart resumes the village rather than restarting it. It is written at most once per `SNAPSHOT_INTERVAL_SECONDS` **and** per `SNAPSHOT_EVERY_DAYS`, and refused above `MAX_SNAPSHOT_MB`. Losing one costs at most the minutes since the last; the log still has everything that happened.
 
-Because the snapshot is a whole-world copy, the world must stay finite: `World.prune()` runs each simulated year, stripping memories and relationships from the dead, forgetting stale acquaintances among the living, capping the in-memory history and chronicle, and deleting long-dead citizens that nothing references. Without it, relationships grow with the square of the population (157k by year 60) and the snapshot grows without limit.
+Two things bound the world's size. `max_relationships` (default 150 — Dunbar's number) caps how many people
+anyone can hold in mind, keeping the social graph linear in population rather than quadratic; family and
+spouses are never the ties dropped. And because the snapshot is a whole-world copy, `World.prune()` runs each simulated year, stripping memories and relationships from the dead, forgetting stale acquaintances among the living, capping the in-memory history and chronicle, and deleting long-dead citizens that nothing references. Without it, relationships grow with the square of the population (157k by year 60) and the snapshot grows without limit.
 
 **Storage cost scales with simulated time, not real time.** A village produces ~2.2 log rows per simulated day, so rows per real day = 2.2 × (86400 / `TICK_SECONDS`). At `TICK_SECONDS=10` that is ~19k rows/day (~4 MB); at 30 it is ~6k (~1.4 MB). Slowing the clock is the cheapest way to make a complete record affordable.
 

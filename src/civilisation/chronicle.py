@@ -43,7 +43,7 @@ def eras(world, years_per_era: int = 5) -> List[dict]:
     while start < world.day:
         end = min(world.day, start + span)
         rows = [r for r in hist if start <= r["day"] <= end]
-        evs = [e for e in world.chronicle if start < e.day <= end]
+        evs = [e for e in world.chronicle if start < e.day <= end and not e.secret and e.village in (world.focus, -1)]
         if rows:
             out.append({"start": start, "end": end, "name": _era_name(rows[0], rows[-1], evs),
                         "events": evs, "pop": rows[-1]["population"], "gini": rows[-1]["gini"]})
@@ -53,7 +53,7 @@ def eras(world, years_per_era: int = 5) -> List[dict]:
 
 def turning_points(world, n: int = 25):
     """The most important events, spaced out so one bad month doesn't take every slot."""
-    evs = sorted(world.chronicle, key=lambda e: -e.importance)
+    evs = sorted([e for e in world.chronicle if not e.secret and e.village in (world.focus, -1)], key=lambda e: -e.importance)
     chosen, taken = [], []
     for e in evs:
         if e.category in ("year",):

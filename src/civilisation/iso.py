@@ -13,19 +13,31 @@ JOB_COLOUR = {"farmer": "#2f9e44", "baker": "#e8a317", "craftsperson": "#e8590c"
               "innkeeper": "#d6336c", "teacher": "#12b886", "doctor": "#e03131", "unemployed": "#868e96", "child": "#f8f9fa", "retired": "#adb5bd"}
 
 
-def world_payload(world, selected: int | None = None) -> dict:
-    bs = [{"x": b.x, "y": b.y, "kind": b.kind, "name": b.name, "staff": len(b.employees), "cash": round(b.cash), "herd": getattr(b, "livestock", 0)}
-          for b in world.open_businesses()]
+def world_payload(world, selected: int | None = None, follow: bool = False, look=None) -> dict:
+    """Everything the renderers draw: the whole realm, its people and animals, wars and effects."""
+    bs = [{"x": b.x, "y": b.y, "kind": b.kind, "name": b.name, "staff": len(b.employees), "cash": round(b.cash), "herd": getattr(b, "livestock", 0),
+           "v": b.village} for b in world.open_businesses_all()]
     cs = []
-    for c in world.alive():
+    everyone = world.alive_all()
+    for c in everyone:
+        emo, lvl = c.dominant()
         cs.append({"id": c.id, "x": c.pos[0], "y": c.pos[1], "job": c.job, "name": c.name, "col": JOB_COLOUR.get(c.job, "#999"),
-                   "inf": c.infected, "sel": c.id == selected, "age": c.age_on(world.day)})
-    homes = sorted({c.home for c in world.alive()})
+                   "inf": c.infected, "sel": c.id == selected, "age": c.age_on(world.day), "v": c.village, "sex": c.sex,
+                   "role": c.role, "jail": c.jailed_until >= world.day, "emo": emo if lvl > 0.5 else "",
+                   "mage": bool(c.magic and c.magic.get("awakened") and c.magic.get("revealed"))})
+    an = [{"id": a.id, "x": a.pos[0], "y": a.pos[1], "sp": a.species, "name": a.name, "wild": a.wild, "doing": a.doing,
+           "sel": a.id == selected} for a in world.animals.values() if a.alive]
+    homes = sorted({c.home for c in everyone})
     from .eras import era
-    return {"w": world.width, "h": world.height, "grid": world.grid.tolist(), "buildings": bs, "citizens": cs,
-            "homes": [list(h) for h in homes], "day": world.day, "style": era(world)["style"],
+    vs = [{"idx": v.idx, "el": v.element, "name": v.name, "col": v.colour, "region": list(v.region), "centre": list(v.centre),
+           "occ": v.occupier, "fallen": v.fallen, "dam": list(v.dam) if v.dam else None} for v in world.villages]
+    wars = [{"a": x["a"], "b": x["b"], "front": list(x["front"])} for x in world.wars if x.get("active")]
+    return {"w": world.width, "h": world.height, "grid": world.grid.tolist(), "gv": world.grid_version, "buildings": bs, "citizens": cs,
+            "animals": an, "homes": [list(h) for h in homes], "day": world.day, "style": era(world)["style"], "villages": vs, "wars": wars,
+            "fx": [dict(f) for f in world.fx], "focus": world.focus, "follow": bool(follow), "sel": selected, "look": list(look) if look else None,
             "codes": {"WATER": terrain.WATER, "GRASS": terrain.GRASS, "FARM": terrain.FARMLAND, "FOREST": terrain.FOREST,
-                      "ROCK": terrain.ROCK, "TOWN": terrain.TOWN, "ROAD": terrain.ROAD}}
+                      "ROCK": terrain.ROCK, "TOWN": terrain.TOWN, "ROAD": terrain.ROAD, "SAND": terrain.SAND, "SNOW": terrain.SNOW,
+                      "ASH": terrain.ASH, "LAVA": terrain.LAVA, "DAM": terrain.DAM, "RUIN": terrain.RUIN}}
 
 
 JS = r"""
@@ -138,6 +150,12 @@ function draw(time) {
       else if (t === T.ROCK) { const h = 1 + Math.floor(2.5 * rnd(x, y, 4)); block(x, y, 0, h, rnd(x, y, 6) > 0.5 ? '#8f8f8a' : '#7d7d78'); if (h > 2) block(x, y, h, 0.5, '#d9d9d6', 0.2, 0.2, 0.6, 0.6); }
       else if (t === T.TOWN) block(x, y, 0, 0.5, rnd(x, y, 7) > 0.5 ? '#cfc2a8' : '#c4b69b');
       else if (t === T.ROAD) block(x, y, 0, 0.5, '#b8a888');
+      else if (t === T.SAND) block(x, y, 0, 0.5, '#e2cf98');
+      else if (t === T.SNOW) { block(x, y, 0, 2, '#9aa0a6'); block(x, y, 2, 0.4, '#eef3f7'); }
+      else if (t === T.ASH) block(x, y, 0, 0.5, rnd(x, y, 7) > 0.5 ? '#4a403b' : '#3f3632');
+      else if (t === T.LAVA) block(x, y, -0.1, 0.4, '#ff5a1f', 0, 0, 1, 1, 0.9 + 0.2 * Math.sin(time / 300 + x));
+      else if (t === T.DAM) { block(x, y, -0.4, 0.4, '#3b82c4'); block(x, y, 0, 1.2, '#6b5a44', 0.1, 0.35, 0.8, 0.3); }
+      else if (t === T.RUIN) { block(x, y, 0, 0.5, '#5b5550'); block(x, y, 0.5, 0.5, '#7a716a', 0.2, 0.3, 0.3, 0.3); }
       const b = bAt[x + ',' + y];
       if (b) {
         const [wall, rf] = BUILD[b.kind];
@@ -201,9 +219,8 @@ def render_html(world, selected: int | None = None, height: int = 620, url: str 
     return HTML.replace("__H__", str(height)).replace("__JS__", JS.replace("__DATA__", json.dumps(payload)).replace("__URL__", url))
 
 
-def write_snapshot(world, path: str, selected: int | None = None):
-    payload = world_payload(world, selected)
-    payload["sel"] = selected
+def write_snapshot(world, path: str, selected: int | None = None, follow: bool = False, look=None):
+    payload = world_payload(world, selected, follow, look)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f)

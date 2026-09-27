@@ -6,7 +6,8 @@ from ..models import Citizen, TRAITS, REL_FAMILY, REL_SPOUSE
 from . import politics
 
 ADULT_GOALS = ["earn money", "find a partner", "start a business", "help family", "learn a skill",
-               "become respected", "have children", "see the world change"]
+               "become respected", "have children", "see the world change", "gain power", "master the old arts",
+               "protect the village", "live quietly", "get rich"]
 
 
 def _hazard(age: int, health: float, longevity: float) -> float:
@@ -40,7 +41,9 @@ def daily(world):
         # --- mood baseline: drift toward a personality-determined set point
         setpoint = (0.42 + 0.25 * (c.personality["extraversion"] - c.personality["neuroticism"])
                     + 0.12 * min(1, c.money / 3000) + (0.06 if c.employer_id is not None else -0.04))
-        c.happiness += (setpoint - c.happiness) * 0.03
+        # moods drift back toward temperament, slowly — a hard year is not undone in a month
+        setpoint -= 0.15 * min(1.0, sum(1 for m in c.memories[-12:] if m.emotion in ("grief", "anger", "fear", "shame") and m.importance > 0.6) / 4)
+        c.happiness += (setpoint - c.happiness) * 0.012
         # --- children & education
         if 5 <= age < 18:
             if school and school_quality > 0:
@@ -65,11 +68,24 @@ def daily(world):
             c.goal_progress = float(np.clip((c.reputation + 1) / 2, 0, 1))
         elif c.goal == "have children":
             c.goal_progress = min(1.0, len(c.children) / 2)
+        elif c.goal == "get rich":
+            c.goal_progress = min(1.0, c.money / 15000)
+        elif c.goal == "gain power":
+            c.goal_progress = 1.0 if c.role == "councillor" else min(0.9, max(0.0, c.reputation))
+        elif c.goal == "master the old arts":
+            c.goal_progress = (c.magic or {}).get("power", 0.0)
+        elif c.goal == "protect the village":
+            c.goal_progress = 0.6 if c.role in ("guard", "police") else c.goal_progress
+        elif c.goal == "get revenge":
+            t = world.citizens.get(c.goal_target) if c.goal_target else None
+            if t is None or not t.alive:
+                c.goal_progress = 1.0
         if c.goal_progress >= 1.0 and rng.random() < 0.05:
             c.remember(world.day, f"I finally did it: {c.goal}.", "pride", 0.5, tag="life")
             c.happiness = min(1, c.happiness + 0.1)
             c.goal = rng.choice([g for g in ADULT_GOALS if g != c.goal])
             c.goal_progress = 0.0
+            c.goal_target = None
         # --- death
         p = _hazard(age, c.health, cfg["longevity"])
         if c.health <= 0.02:
@@ -117,7 +133,7 @@ def births(world):
         recent = any(k for k in c.children if world.day - world.citizens[k].born_day < 400)
         if recent:
             continue
-        p = 0.0016 * cfg["fertility"] * crowd * (0.5 + c.happiness) * (0.6 if c.money + sp.money < 300 else 1.0)
+        p = 0.0045 * cfg["fertility"] * crowd * (0.5 + c.happiness) * (0.6 if c.money + sp.money < 300 else 1.0)
         p *= max(0.3, 1 - 0.12 * len(c.children))
         if world.food < len(alive) * 2:
             p *= 0.4
@@ -139,7 +155,7 @@ def make_child(world, a: Citizen, b: Citizen) -> Citizen:
     child = Citizen(id=world._new_id(), name=world.new_name(sex, surname), sex=sex, born_day=world.day, personality=p,
                     money=0.0, job="child", home=a.home, pos=a.home, happiness=0.75, health=0.97,
                     education=0.05, skill=0.1, goal="grow up", parent_ids=[a.id, b.id],
-                    generation=max(a.generation, b.generation) + 1, surname=surname)
+                    generation=max(a.generation, b.generation) + 1, surname=surname, village=a.village, origin=a.village)
     child.beliefs = {"economic": 0.0, "authority": 0.0, "trust": 0.6}
     world.citizens[child.id] = child
     for par in (a, b):
@@ -156,7 +172,7 @@ def make_child(world, a: Citizen, b: Citizen) -> Citizen:
     return child
 
 
-def die(world, c: Citizen, cause: str):
+def die(world, c: Citizen, cause: str, killer: int = None):
     c.alive = False
     c.died_day = world.day
     c.cause_of_death = cause
@@ -204,7 +220,13 @@ def die(world, c: Citizen, cause: str):
     importance = 0.6 if cause in ("starvation", "illness", "flood", "raid") else (0.5 if age < 50 else 0.4)
     if age < 18:
         importance = 0.7
-    world.emit("life", f"{c.name} died of {cause} at {age}.", importance, mourners[:3])
+    if killer is not None:
+        importance = max(importance, 0.8)
+    with world.at(c.village):
+        world.emit("life", f"{c.name} died of {cause} at {age}.", importance, mourners[:3] + ([killer] if killer is not None else []),
+                   tone="bad", kind="murdered" if killer is not None else "death", culprit=killer)
+    if c.role:
+        c.role = ""
     for mid in mourners:
         m = world.citizens[mid]
         m.happiness = max(0, m.happiness - 0.1)
