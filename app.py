@@ -195,6 +195,8 @@ def shared_village():
                    min_importance=float(os.environ.get("STORE_MIN_IMPORTANCE", 0)))
     rec.prime(w, restored=state["restored"])
     state["recorder"] = rec
+    if state.get("migrated"):
+        rec.flush(w, force_snapshot=True)      # save the new realm now, so a restart never migrates the old village twice
 
     def loop():
         while True:
@@ -203,6 +205,7 @@ def shared_village():
                 try:
                     state["world"].step(state["days_per_tick"])
                     rec.flush(state["world"])
+                    state["error"] = ""                # a clean day clears the last complaint
                 except Exception as e:
                     state["error"] = f"{type(e).__name__}: {e}"
     threading.Thread(target=loop, daemon=True, name="village-ticker").start()

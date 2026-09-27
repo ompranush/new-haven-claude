@@ -157,18 +157,53 @@ class LLMBrain:
             if self.verbose:
                 print(f"[LLMBrain] fallback to rules: {e}")
             return None
+        try:
+            return self._reaction_from(data, base)
+        except Exception as e:                    # a malformed answer must never reach the world: the dice decide instead
+            self.failures += 1
+            from .security import scrub
+            self.last_error = scrub(f"unreadable answer ({type(e).__name__}: {e})")
+            return None
+
+    @staticmethod
+    def _reaction_from(data, base=None) -> Reaction:
+        """Turn a model's JSON into a Reaction, tolerating numbers sent as text and missing or odd fields."""
         from .brains import LEGACY
+
+        def num(v, default=0.0, lo=None, hi=None):
+            try:
+                x = float(str(v).strip().replace("\u2212", "-")) if isinstance(v, str) else float(v)
+            except (TypeError, ValueError):
+                x = default
+            if x != x:                               # NaN
+                x = default
+            if lo is not None:
+                x = max(lo, x)
+            if hi is not None:
+                x = min(hi, x)
+            return x
+
+        if not isinstance(data, dict):
+            raise ValueError("answer is not an object")
         menu = [k for k, _ in (base.options if base is not None else [])]
-        act = str(data.get("action", "")).strip()
+        act = str(data.get("action", "") or "").strip()
         act = LEGACY.get(act, act)
         if menu and act not in menu:
             act = base.action                     # an answer off the menu: the dice decide
+        rel = {}
+        for x in data.get("relationship_changes") or []:
+            try:
+                rel[int(num(x.get("citizen_id"), -1))] = num(x.get("delta"), 0.0, -40, 40)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        beliefs = data.get("belief_shift") if isinstance(data.get("belief_shift"), dict) else {}
+        emotion = str(data.get("emotion", "neutral") or "neutral").strip().lower()
         r = Reaction(
-            emotion=data["emotion"] if data["emotion"] in EMOTIONS else "neutral", intensity=float(min(1, max(0, data["intensity"]))),
-            memory=data["memory"], relationship_changes={int(x["citizen_id"]): float(x["delta"]) for x in data["relationship_changes"]},
-            grievance_delta=float(min(0.3, max(-0.3, data["grievance_delta"]))),
-            belief_shift={k: float(v) for k, v in data["belief_shift"].items()},
-            action=act or "none", source="llm",
+            emotion=emotion if emotion in EMOTIONS else "neutral", intensity=num(data.get("intensity"), 0.5, 0.0, 1.0),
+            memory=str(data.get("memory", "") or "")[:600], relationship_changes={k: v for k, v in rel.items() if k >= 0},
+            grievance_delta=num(data.get("grievance_delta"), 0.0, -0.3, 0.3),
+            belief_shift={k: num(v, 0.0, -0.3, 0.3) for k, v in beliefs.items() if k in ("economic", "authority", "trust")},
+            action=act or (base.action if base is not None else "none"), source="llm",
         )
         if base is not None:
             r.situation, r.options, r.target, r.level = base.situation, base.options, base.target, base.level
@@ -192,7 +227,13 @@ class LLMBrain:
         done, keep = [], []
         for cid, ev, fb, fut in self.pending:
             if fut.done():
-                r = fut.result()
+                try:
+                    r = fut.result()
+                except Exception as e:                    # never let one bad answer jam the queue
+                    self.failures += 1
+                    from .security import scrub
+                    self.last_error = scrub(f"{type(e).__name__}: {e}")
+                    r = None
                 done.append((cid, ev, r or fb))
             else:
                 keep.append((cid, ev, fb, fut))

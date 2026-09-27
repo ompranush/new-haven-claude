@@ -153,3 +153,39 @@ def test_animals_live_and_can_be_adopted():
     assert pet.owner_id == person.id
     w.step(30)
     assert pet.id in w.animals
+
+
+def test_a_model_sending_numbers_as_text_or_junk_never_stops_the_world():
+    """Production froze when Gemini answered "intensity": "0.7" — every answer shape must be survivable."""
+    from civilisation.llm import LLMBrain
+    from civilisation.providers import Backend, Usage
+
+    answers = [
+        {"emotion": "anger", "intensity": "0.7", "memory": "I won't forget.", "relationship_changes": [{"citizen_id": "3", "delta": "-12"}],
+         "grievance_delta": "0.1", "belief_shift": {"economic": "-0.1", "authority": "0.05", "trust": "x"}, "action": "brawl"},
+        {"emotion": "JOY", "intensity": None, "memory": 42, "relationship_changes": "none", "grievance_delta": "high",
+         "belief_shift": [], "action": 7},
+        "not even an object",
+        {},
+    ]
+
+    class Odd(Backend):
+        provider, model = "fake", "odd-1"
+
+        def __init__(self):
+            self.n = 0
+
+        def json_call(self, system, user, schema, max_tokens=1024, effort="low"):
+            self.n += 1
+            return answers[self.n % len(answers)], Usage()
+
+    w = _world(seed=12)
+    w.brain = LLMBrain(threshold=0.0, max_calls=400, backend=Odd(), workers=2)
+    for _ in range(60):
+        w.step(1)                                   # must never raise
+    import time
+    w.brain.max_calls = w.brain.calls               # no new questions; everything asked so far must come back out
+    time.sleep(0.5)
+    w.step(2)
+    assert w.brain.calls > 0 and not w.brain.pending, "answers must leave the queue"
+    assert any(t["source"] == "llm" for t in w.thoughts), "readable answers still land"

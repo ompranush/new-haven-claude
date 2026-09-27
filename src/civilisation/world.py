@@ -275,11 +275,19 @@ class World:
             for brain in [self.brain] + list(self.brains.values()):
                 drain = getattr(brain, "drain", None)
                 if drain:                               # deferred (async) cognition lands here
-                    for cid, ev, reaction in drain():
+                    try:
+                        landed = drain()
+                    except Exception as e:
+                        self.emit("error", f"a mind's answers could not be read: {type(e).__name__}", 0.0, [], village=-1)
+                        landed = []
+                    for cid, ev, reaction in landed:
                         c = self.citizens.get(cid)
                         if c and c.alive:
                             with self.at(c.village):
-                                self._apply_reaction(c, ev, reaction)
+                                try:
+                                    self._apply_reaction(c, ev, reaction)
+                                except Exception as e:    # a reaction that won't apply is dropped; the day goes on
+                                    self.emit("error", f"{c.name}'s reaction could not be applied: {type(e).__name__}", 0.0, [], village=-1)
             from . import behaviour
             from .systems import river, war, magic, animals
             river.daily(self)
