@@ -104,6 +104,7 @@ def daily(world):
     demand_mult = cfg["demand_multiplier"] * (0.5 if world.recession_days > 0 else 1.0) * (1.4 if world.boom_days > 0 else 1.0) \
         * (1.2 if "tax_holiday" in laws else 1.0) * (0.7 if "quarantine" in laws else 1.0)
     striking = set(world.strike["members"]) if world.strike else set()
+    striking |= {c.id for c in alive if c.jailed_until >= world.day}      # nobody works from the cells, and nobody pays them
     from .river import farm_factor
     drought = (0.45 if world.drought_days > 0 else 1.0) * farm_factor(world.village)      # the river decides the harvest
 

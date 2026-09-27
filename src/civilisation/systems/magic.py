@@ -76,7 +76,7 @@ def war_power(world, idx: int, reveal: bool = False) -> float:
     """What the village's mages add in battle. Using it reveals them."""
     v = world.villages[idx]
     mages = [c for c in world.citizens.values() if c.alive and c.village == idx and is_mage(c) and world.free(c)]
-    total = sum(8.0 * c.magic["power"] ** 1.3 for c in mages)
+    total = sum(mage_worth(c) for c in mages)
     if reveal and mages:
         spell, verb = SPELLS.get(v.element, ("magic", "struck"))
         for c in mages:
@@ -124,6 +124,44 @@ def daily(world):
     _resurrections(world)
 
 
+def mage_worth(c) -> float:
+    """What one mage adds to their village's strength in battle (a healthy guard is worth about 2)."""
+    return 8.0 * c.magic["power"] ** 1.3 if is_mage(c) else 0.0
+
+
+def rise_odds(world, v) -> float:
+    """Weekly chance that an occupied village's mages drive the garrison out (0 if they are too weak to try)."""
+    if v.occupier is None:
+        return 0.0
+    own = [c for c in world.citizens.values() if c.alive and c.origin == v.idx and is_mage(c) and world.free(c)]
+    power = sum(c.magic["power"] for c in own)
+    if power <= 0.3:
+        return 0.0
+    garrison = max(1.0, 0.3 * sum(1 for c in world.citizens.values() if c.alive and c.village == v.occupier and c.role == "guard"))
+    return min(0.5, 0.04 * (power * 6 + v.morale * 3) / garrison)
+
+
+def return_odds(world, v) -> float:
+    """Weekly chance that a ruined village's scattered mages lead its people home."""
+    if not v.fallen:
+        return 0.0
+    own = [c for c in world.citizens.values() if c.alive and c.origin == v.idx and is_mage(c) and world.free(c)]
+    return 0.05 * sum(c.magic["power"] for c in own) if own else 0.0
+
+
+def circle(world, idx: int) -> dict:
+    """Everything about one village's secret circle: its mages (born there, wherever they live now), its apprentices,
+    its strength in battle, and its chances of freeing or rebuilding the village."""
+    v = world.villages[idx]
+    mages = sorted([c for c in world.citizens.values() if c.alive and c.origin == idx and is_mage(c)], key=lambda c: -c.magic["power"])
+    pupils = sorted([c for c in world.citizens.values() if c.alive and c.origin == idx and not is_mage(c)
+                     and ((c.magic and c.magic.get("practice", 0) >= 0.1) or c.goal == "master the old arts")],
+                    key=lambda c: -((c.magic or {}).get("practice", 0)))
+    here = [c for c in mages if c.village == idx and world.free(c)]
+    return {"village": v, "mages": mages, "apprentices": pupils, "battle": sum(mage_worth(c) for c in here),
+            "rise": rise_odds(world, v), "return": return_odds(world, v)}
+
+
 def _resurrections(world):
     """Occupied villages rise when their mages are strong enough; fallen ones are rebuilt by their scattered mages."""
     rng = world.rng
@@ -132,10 +170,8 @@ def _resurrections(world):
         power = sum(c.magic["power"] for c in own)
         if v.occupier is not None:
             occ = world.villages[v.occupier]
-            with world.at(occ.idx):
-                garrison = max(1.0, 0.3 * sum(1 for c in world.alive() if c.role == "guard"))
-            p = 0.04 * (power * 6 + v.morale * 3) / garrison
-            if power > 0.3 and rng.random() < min(0.5, p):
+            p = rise_odds(world, v)
+            if p > 0 and rng.random() < p:
                 spell, _ = SPELLS[v.element]
                 v.occupier, v.occupied_since = None, None
                 v.policy.ruling_party = f"The {v.element.title()} Circle"
@@ -155,7 +191,7 @@ def _resurrections(world):
                                [c.id for c in world.alive()][:3], kind="liberated", tone="good")
                     from . import war
                     war.assign_roles(world)
-        elif v.fallen and own and rng.random() < 0.05 * power:
+        elif v.fallen and own and rng.random() < return_odds(world, v):
             # the circle leads the diaspora home
             from .crime import relocate
             from .. import terrain

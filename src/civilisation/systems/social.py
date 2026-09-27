@@ -51,6 +51,10 @@ def adjust(world, a: Citizen, b: Citizen, delta: float):
 def _move(world, c: Citizen):
     """Daytime location. Rendering only — but proximity feeds who meets whom."""
     rng = world.rng
+    if c.jailed_until >= world.day:                      # in the cells, by the council house
+        cx, cy = world.village.centre
+        c.pos = (cx + rng.randint(-1, 1), cy + rng.randint(-1, 1))
+        return
     if c.infected and c.health < 0.5:
         c.pos = c.home
         return

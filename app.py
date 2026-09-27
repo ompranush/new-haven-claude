@@ -84,7 +84,9 @@ st.markdown("""
   .quote{color:#8b98a8;font-style:italic;font-size:13px;text-align:center;padding:10px}
   div[data-testid="stVerticalBlockBorderWrapper"]{background:#141d2b;border:1px solid #1f2a3a !important;border-radius:14px;padding:4px 6px}
   div[data-testid="stVerticalBlockBorderWrapper"] h4{margin:0 0 6px 0;font-size:15px;color:#e6edf3}
-  div[data-testid="stSegmentedControl"] button{border-radius:10px}
+  div[data-testid="stSegmentedControl"] button{border-radius:10px;padding:4px 9px;min-height:34px}
+  div[data-testid="stSegmentedControl"] button p{font-size:13.5px;white-space:nowrap}
+  .brand .t{font-size:21px !important}
 </style>
 """, unsafe_allow_html=True)
 
@@ -197,6 +199,8 @@ def shared_village():
     state["recorder"] = rec
     if state.get("migrated"):
         rec.flush(w, force_snapshot=True)      # save the new realm now, so a restart never migrates the old village twice
+    import atexit
+    atexit.register(lambda: rec.save_now(state["world"], timeout=5.0))     # a graceful shutdown (a redeploy) saves first
 
     def loop():
         while True:
@@ -388,6 +392,8 @@ try:
   # which of the five villages this visitor is looking at (their own person's, at first)
   if ss.get("pending_village") is not None:          # set before the picker is drawn (widgets can't be changed after)
       ss.village = ss.pop("pending_village")
+  if ss.get("pending_nav"):
+      ss.nav = ss.pop("pending_nav")
   if ss.get("village") is None or not (0 <= int(ss.get("village")) < len(w.villages)):
       rid0 = ss.get("resident_id")
       ss.village = w.citizens[rid0].village if rid0 in w.citizens else (w.animals[rid0].village if rid0 in w.animals else 0)
@@ -470,7 +476,7 @@ try:
 
 
   # ------------------------------------------------------------------ header
-  h1, h2, h3, h4 = st.columns([1.5, 5.0, 0.8, 1.3])
+  h1, h2, h3, h4 = st.columns([1.2, 5.9, 0.75, 1.15])
   with h1:
       st.markdown('<div class="brand"><span style="font-size:34px">🌲</span><div><div class="t">New Haven</div><div class="s">An AI Civilisation Simulator</div></div></div>', unsafe_allow_html=True)
   def pace_phrase(state) -> str:
@@ -545,7 +551,7 @@ try:
               w.step(365)
           st.rerun()
   with h2:
-      PAGES = ["🌍 World", "👥 Citizens", "📊 Economy", "🏛️ Politics", "⚡ Events", "🏡 Move in", "🧪 Research", "⚙️ Settings"]
+      PAGES = ["🌍 World", "👥 Citizens", "📊 Economy", "🏛️ Politics", "✦ Magic", "⚡ Events", "🏡 Move in", "🧪 Research", "⚙️ Settings"]
       page = st.segmented_control("nav", PAGES, default=PAGES[0], key="nav", label_visibility="collapsed") or PAGES[0]
 
   def village_label(i):
@@ -673,7 +679,7 @@ try:
           emp = w.businesses.get(c.employer_id) if c.employer_id else None
           mood = "😊 Happy" if c.happiness > 0.65 else ("😐 Fine" if c.happiness > 0.45 else "😟 Struggling")
           near = min(w.open_businesses(), key=lambda b: abs(b.x - c.pos[0]) + abs(b.y - c.pos[1]), default=None)
-          where = "Home" if c.pos == c.home or (abs(c.pos[0] - c.home[0]) + abs(c.pos[1] - c.home[1]) <= 2) else (near.name if near and abs(near.x - c.pos[0]) + abs(near.y - c.pos[1]) <= 2 else "Out and about")
+          where = "In the cells" if c.jailed_until >= w.day else "Home" if c.pos == c.home or (abs(c.pos[0] - c.home[0]) + abs(c.pos[1] - c.home[1]) <= 2) else (near.name if near and abs(near.x - c.pos[0]) + abs(near.y - c.pos[1]) <= 2 else "Out and about")
           hue = (c.id * 47) % 360
           social = min(1.0, sum(1 for r in c.relationships.values() if r.score >= 40) / 8)
           mems = sorted(c.memories, key=lambda m: -m.day)[:4]
@@ -685,7 +691,9 @@ try:
                       + bar("Health", c.health, "#4ade80") + bar("Happiness", c.happiness, "#3b82f6") + bar("Energy", 1 - c.hunger, "#eda100") + bar("Social", social, "#8b5cf6")
                       + feelings_html(c) + (f'<div style="font-size:12px;color:#c9d3df;margin-top:4px">🏛️ {c.role.title()} of {esc(VILLAGE_NOW.name)}</div>' if c.role else "")
                       + (f'<div style="font-size:12px;color:#8b5cf6;margin-top:4px">✦ {c.magic["element"]} mage · power {c.magic["power"]*100:.0f}%'
-                         + ('' if c.magic.get("revealed") else ' · <i>secret</i>') + '</div>' if c.magic and c.magic.get("awakened") and (IS_GOD or c.magic.get("revealed")) else "")
+                         + ('' if c.magic.get("revealed") else ' · <i>secret</i>') + '</div>' if c.magic and c.magic.get("awakened") and (IS_GOD or c.magic.get("revealed"))
+                         else (f'<div style="font-size:12px;color:#8b5cf6;margin-top:4px">📜 apprentice of the old arts · practice {c.magic.get("practice", 0)*100:.0f}%</div>'
+                               if IS_GOD and c.magic and c.magic.get("practice", 0) > 0 else ""))
                       + (f'<div style="font-size:12px;color:#f87171;margin-top:4px">⛓️ In the cells until day {c.jailed_until:,}</div>' if c.jailed_until >= w.day else "")
                       + last_roll_html(c)
                       + f'<div style="font-size:13px;color:#8b98a8;margin-top:6px">Current goal</div><div style="font-size:14px;color:#fff">🎯 {c.goal.capitalize()} <span style="color:#8b98a8">({c.goal_progress*100:.0f}%)</span></div>'
@@ -817,6 +825,16 @@ try:
       c1, c2 = st.columns([1.4, 1])
       with c1:
           everywhere = st.toggle("Whole realm", value=False, key="cit_all")
+          def magic_of(cid):
+              c = w.citizens.get(cid)
+              m = c.magic if c else None
+              if not m:
+                  return ""
+              if m.get("awakened") and (IS_GOD or m.get("revealed")):
+                  return f"✦ {m['element']} {m['power']*100:.0f}%" + ("" if m.get("revealed") else " (secret)")
+              return f"apprentice {m.get('practice', 0)*100:.0f}%" if IS_GOD and m.get("practice", 0) >= 0.1 else ""
+          if len(df):
+              df.insert(3, "magic", df["id"].map(magic_of))
           if not everywhere and len(df):
               df = df[df.village == VILLAGE_NOW.name]
           st.dataframe(df.drop(columns=["x", "y"]).sort_values("id"), use_container_width=True, height=560, hide_index=True)
@@ -933,8 +951,92 @@ try:
           fig.update_layout(height=200, **PLOT)
           st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-  # ------------------------------------------------------------------ EVENTS
+  # ------------------------------------------------------------------ MAGIC
   if page == PAGES[4]:
+      from civilisation.systems import magic as magic_sys
+      st.markdown("#### The secret circles")
+      st.caption("Each village has a hidden circle that can work its element. Nobody is born a mage: power comes from years of practice "
+                 "(the goal *master the old arts*), or wakes in someone at the edge of grief or rage — or god grants it. A steward can't. "
+                 "Mages keep themselves secret until war draws them out: in battle each one is worth several guards, and using it reveals them. "
+                 "When their village is occupied, the circle plots to drive the garrison out; when it falls to ruin, its scattered mages are "
+                 "the only way its people ever go home. "
+                 + ("**You are god: you see every mage and apprentice.**" if IS_GOD else "**Only mages who have revealed themselves are shown.**"))
+      WHAT = {"fire": "fireballs · the forge", "water": "waves · rain · healing", "earth": "quakes · stone · roots",
+              "air": "whirlwinds · speed", "sky": "lightning · storms · stars"}
+      circles = [magic_sys.circle(w, v.idx) for v in w.villages]
+      cols = st.columns(5)
+      for col, cr in zip(cols, circles):
+          v = cr["village"]
+          shown = [c for c in cr["mages"] if IS_GOD or c.magic.get("revealed")]
+          guards = cr["battle"] / 2.0
+          if v.occupier is not None:
+              fate = (f"⛓ held by {esc(w.villages[v.occupier].name)} · rising: <b>{cr['rise']*100:.0f}%</b>/week" if IS_GOD
+                      else f"⛓ held by {esc(w.villages[v.occupier].name)}")
+          elif v.fallen:
+              fate = f"☠ in ruins · return: <b>{cr['return']*100:.0f}%</b>/week" if IS_GOD else "☠ in ruins"
+          else:
+              fate = "free"
+          col.markdown(
+              f'<div class="panel" style="border-top:3px solid {v.colour}"><h4>{ELEMENTS[v.element]["emblem"]} {esc(v.name)}</h4>'
+              f'<div style="font-size:12px;color:#c9d3df">{v.element.title()} — {esc(ELEMENTS[v.element]["power"])}<br>'
+              f'<span style="color:#8b98a8">in battle: {WHAT[v.element]}</span></div>'
+              + stat("✦", "Mages" + ("" if IS_GOD else " (revealed)"), f"{len(shown)}")
+              + (stat("📜", "Apprentices", f"{len(cr['apprentices'])}") if IS_GOD else "")
+              + (stat("⚔️", "Worth defending it", f"≈ {guards:.0f} guards") if IS_GOD else "")
+              + (f'<div style="font-size:11px;color:#8b98a8">counts mages living there and free; exiles and prisoners can\'t fight for it</div>'
+                 if IS_GOD and len(cr["mages"]) and guards < 0.5 else "")
+              + f'<div style="font-size:12px;color:#c9d3df;margin-top:6px">{fate}</div></div>', unsafe_allow_html=True)
+      rows = []
+      for cr in circles:
+          v = cr["village"]
+          for c in cr["mages"]:
+              if not (IS_GOD or c.magic.get("revealed")):
+                  continue
+              rows.append({"name": c.name, "circle": v.name, "lives in": w.villages[c.village].name, "element": c.magic["element"],
+                           "power": f"{c.magic['power']*100:.0f}%", "worth in battle": f"≈ {magic_sys.mage_worth(c)/2:.1f} guards",
+                           "revealed": "yes" if c.magic.get("revealed") else "secret", "age": c.age_on(w.day), "job": job_label(w, c.job),
+                           "role": c.role, "goal": c.goal, "in the cells": c.jailed_until >= w.day, "id": c.id})
+      st.markdown("#### Mages")
+      if rows:
+          st.dataframe(pd.DataFrame(rows).drop(columns=["id"]), hide_index=True, use_container_width=True)
+          pick = st.selectbox("Show a mage on the map", [r["id"] for r in rows],
+                              format_func=lambda i: f"{w.citizens[i].name} — {w.villages[w.citizens[i].village].name}", key="mage_pick")
+          if st.button("🎥 Go and watch them", key="mage_go"):
+              c = w.citizens[pick]
+              ss.pending_village = c.village; ss.selected = c.id; ss.follow = True; ss.pending_nav = PAGES[0]; ss.look = None
+              st.rerun()
+      else:
+          st.caption("No mage has revealed themselves yet. They will, when a war comes." if not IS_GOD else "There are no mages left alive.")
+      if IS_GOD:
+          st.markdown("#### Apprentices — practising, not yet awakened")
+          pupils = [(c, cr["village"]) for cr in circles for c in cr["apprentices"]]
+          if pupils:
+              st.dataframe(pd.DataFrame([{"name": c.name, "circle": v.name, "lives in": w.villages[c.village].name,
+                                          "practice": f"{(c.magic or {}).get('practice', 0)*100:.0f}%", "goal": c.goal,
+                                          "openness": round(c.personality["openness"], 2), "age": c.age_on(w.day)} for c, v in pupils]),
+                           hide_index=True, use_container_width=True)
+              st.caption("Practice builds with the *practise the old arts* act and the goal *master the old arts*. Past about 45% practice, "
+                         "each session has a small chance to awaken them; open, diligent people get there faster.")
+          else:
+              st.caption("Nobody is practising the old arts right now.")
+          st.markdown("#### Grant or take away power")
+          g1, g2, g3 = st.columns([2, 1, 1])
+          everyone = sorted(w.alive_all(), key=lambda c: (c.village, c.name))
+          who = g1.selectbox("Person", [c.id for c in everyone], key="grant_who",
+                             format_func=lambda i: f"{w.citizens[i].name} — {w.villages[w.citizens[i].village].name}"
+                             + (" ✦" if magic_sys.is_mage(w.citizens[i]) else ""))
+          pw = g2.slider("Power", 0.1, 1.0, 0.6, 0.05, key="grant_power")
+          if g3.button("✦ Grant", use_container_width=True, key="grant_go"):
+              c = w.citizens[who]
+              with w.at(c.village):
+                  magic_sys.awaken(w, c, element=w.villages[c.origin].element, power=pw, why="a gift from the gods", granted=True)
+              st.toast(f"{c.name} can call on the {c.magic['element']} now.", icon="✦"); st.rerun()
+          if g3.button("Take it away", use_container_width=True, key="grant_strip", disabled=not magic_sys.is_mage(w.citizens[who])):
+              w.citizens[who].magic = None
+              st.toast(f"{w.citizens[who].name}'s power is gone.", icon="✦"); st.rerun()
+
+  # ------------------------------------------------------------------ EVENTS
+  if page == PAGES[5]:
       e1, e2 = st.columns([1.2, 1])
       with e1:
           text = chronicle_text(w)
@@ -991,7 +1093,7 @@ try:
 
   # ------------------------------------------------------------------ RESEARCH
 
-  if page == PAGES[5]:
+  if page == PAGES[6]:
       rid = ss.get("resident_id")
       if rid and rid not in w.citizens and rid not in w.animals:
           rid = ss.resident_id = None
@@ -1350,7 +1452,7 @@ try:
           else:
               st.caption("Nobody has moved in yet.")
 
-  if page == PAGES[6]:
+  if page == PAGES[7]:
       st.markdown("Run scenarios across many seeds and compare **distributions** of outcomes — this is the point of the project.")
       chosen = st.multiselect("Scenarios", list(SCENARIOS), default=["baseline", "automation"])
       c1, c2, c3 = st.columns(3)
@@ -1373,7 +1475,7 @@ try:
           st.download_button("Download raw results.csv", df.to_csv(index=False), "results.csv")
 
   # ------------------------------------------------------------------ SETTINGS
-  if page == PAGES[7]:
+  if page == PAGES[8]:
       s1, s2 = st.columns(2)
       with s1:
           seed = st.number_input("Seed", 0, 999999, w.seed)
@@ -1411,6 +1513,15 @@ try:
                               st.error("Not today.")
           if PUBLIC and IS_GOD:
               rst = shared["recorder"].stats()
+              ago = (time.time() - rst["last_snapshot_at"]) / 60 if rst["snapshots"] else None       # minutes only for saves made in this run
+              lost = w.day - rst["last_snapshot_day"] if rst["last_snapshot_day"] >= 0 else w.day
+              sv1, sv2 = st.columns([3, 1])
+              sv1.markdown(f"**Last saved:** day {rst['last_snapshot_day']:,}" + (f", {ago:.0f} min ago" if ago is not None else "")
+                           + (f" — a restart now would roll the world back **{lost:,} days**. Save before you deploy." if lost > 0 else " — up to date."))
+              if sv2.button("💾 Save the world now", use_container_width=True, type="primary"):
+                  ok = shared["recorder"].save_now(w)
+                  (st.success if ok else st.error)(f"Saved at day {w.day:,}." if ok else f"Not saved: {shared['recorder'].last_error or 'unknown error'}")
+                  rst = shared["recorder"].stats()
               st.caption(f"Storage: **{shared['store'].status()}** · village '{VILLAGE}' · " + ("restored from snapshot · " if shared.get("restored") else "") +
                          f"{rst['writes']} writes · {rst['snapshots']} snapshots (last {rst['last_snapshot_mb']} MB) · "
                          f"{rst['throttled']} throttled · **{rst['dropped']} lost**"

@@ -407,7 +407,22 @@ class Recorder:
 
     def stats(self) -> dict:
         return {"writes": self.writes, "snapshots": self.snapshots, "throttled": self.skipped, "dropped": self.dropped,
-                "last_snapshot_mb": round(self.last_snapshot_mb, 2), "last_error": self.last_error}
+                "last_snapshot_mb": round(self.last_snapshot_mb, 2), "last_error": self.last_error,
+                "last_snapshot_day": self.last_snapshot_day, "last_snapshot_at": self.last_snapshot_at}
+
+    def save_now(self, world, timeout: float = 10.0) -> bool:
+        """Write the save-game immediately (holding the world still). True if it was stored."""
+        lock = getattr(world, "lock", None)
+        if lock is not None and not lock.acquire(timeout=timeout):
+            self.last_error = "could not pause the world to save it"
+            return False
+        try:
+            before = self.snapshots
+            self.flush(world, force_snapshot=True)
+            return self.snapshots > before
+        finally:
+            if lock is not None:
+                lock.release()
 
 
 def restore_world(store: Store, village: str):
